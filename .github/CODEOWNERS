@@ -1,3 +1,3 @@
-# Requires write access for the owners AND enforced branch protection.
-# Remote settings must be verified before the first production adoption.
+# Sandbox owners. Production must use the verified corporate team.
+# Both owners must retain write access; the author cannot approve their own PR.
 * @alric-corp/github_xj7_maintainer @vigcf
