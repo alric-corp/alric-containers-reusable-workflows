@@ -42,12 +42,18 @@ jobs:
           import re
           import sys
           sys.path.insert(0, '.github/scripts')
-          from runtime_images import supported, project
+          import runtime_images
           framework = os.environ['FRAMEWORK']
-          kind = supported(framework)
+          # API original Node/Python e API estendida dos contratos compilados.
+          # Ambas validam o framework; um método ausente/inválido falha alto.
+          if hasattr(runtime_images, 'supported'):
+              kind = runtime_images.supported(framework)
+          else:
+              runtime_images.runtime(framework)
+              kind = 'interpreted'
           if not re.fullmatch(r'[1-9][0-9]*', os.environ['ARTIFACT_RUN_ID']):
               raise SystemExit('artifact-run-id must be a positive integer')
-          dev = project(framework)[1] if kind == 'compiled' else ''
+          dev = runtime_images.project(framework)[1] if kind == 'compiled' else ''
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
               output.write(f'kind={kind}\ndev={dev}\n')
           PY
@@ -77,9 +83,15 @@ jobs:
       - name: Test both candidate platforms without rebuilding the base image
         env:
           FRAMEWORK: ${{ inputs.framework }}
+          DEV_FRAMEWORK: ${{ steps.contract.outputs.dev }}
         run: |
-          python3 -B .github/scripts/runtime_images.py candidate.oci "$FRAMEWORK" \
-            --dev-layout candidate-dev.oci
+          set -eu
+          if [ -n "$DEV_FRAMEWORK" ]; then
+            python3 -B .github/scripts/runtime_images.py candidate.oci "$FRAMEWORK" \
+              --dev-layout candidate-dev.oci
+          else
+            python3 -B .github/scripts/runtime_images.py candidate.oci "$FRAMEWORK"
+          fi
       - name: Preserve runtime evidence
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

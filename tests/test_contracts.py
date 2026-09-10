@@ -1,6 +1,9 @@
 import copy
+import os
 from pathlib import Path
+import subprocess
 import sys
+import tempfile
 import unittest
 
 import yaml
@@ -74,6 +77,39 @@ class ContractTests(unittest.TestCase):
         self.assertNotIn('continue-on-error', installer)
         self.assertNotIn('continue-on-error', verify)
         self.assertNotIn('TRIVY_VERSION', self.validation.get('env', {}))
+
+    def run_runtime_guard(self, module, framework='nodejs22', run_id='123'):
+        document = yaml.safe_load((ROOT / '.github/workflows/test-runtime-images.yml').read_text())
+        step = next(s for s in document['jobs']['runtime']['steps'] if s.get('id') == 'contract')
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            scripts = directory / '.github/scripts'
+            scripts.mkdir(parents=True)
+            (scripts / 'runtime_images.py').write_text(module)
+            output = directory / 'output.txt'
+            result = subprocess.run(['bash', '-c', step['run']], cwd=directory,
+                                    env=dict(os.environ, FRAMEWORK=framework, ARTIFACT_RUN_ID=run_id,
+                                             GITHUB_OUTPUT=str(output)), text=True, capture_output=True)
+            return result, output.read_text() if output.exists() else ''
+
+    def test_runtime_guard_accepts_original_and_compiled_consumer_apis(self):
+        result, output = self.run_runtime_guard('def runtime(f): return ("node", "probe.cjs")\n')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('dev=\n', output)
+        module = ('def supported(f): return "compiled"\n'
+                  'def project(f): return ("project", "go1-26-dev", "go")\n')
+        result, output = self.run_runtime_guard(module, framework='go1-26')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('dev=go1-26-dev\n', output)
+
+    def test_runtime_guard_rejects_bad_catalog_input_and_cross_run_injection(self):
+        rejected = 'def runtime(f): raise ValueError("framework outside catalog")\n'
+        result, output = self.run_runtime_guard(rejected, framework='../bad')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(output, '')
+        result, output = self.run_runtime_guard('def runtime(f): return "node"\n', run_id='123\ndev=bad')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(output, '')
 
 
 if __name__ == '__main__':
