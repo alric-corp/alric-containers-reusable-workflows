@@ -1,7 +1,7 @@
-# itau-xj7-reusable-workflows
+# alric-containers-reusable-workflows
 
 Executores compartilhados para produtos de containers. O primeiro consumidor
-é `alric-corp/itau-xj7-containers-image-base`.
+é `alric-corp/alric-containers-image-base`.
 
 | API | Responsabilidade | Permissões do chamador |
 | --- | --- | --- |
