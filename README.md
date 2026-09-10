@@ -18,10 +18,15 @@ Gatilhos, catálogo, AWS, publicação/assinatura, promoção, recuperação, sa
 triagem permanecem no consumidor. A action composta executa com as permissões
 do job chamador; ela não cria isolamento.
 
-Consuma sempre `owner/repo/.github/workflows/arquivo.yml@<SHA completo>` no nível
-de job, ou `owner/repo/actions/setup-trivy@<SHA completo>` no nível de step.
-Os chamadores concretos estão no `image-base`. Não use `@main`, `@v1` ou
-`secrets: inherit`. Os workflows compartilhados não possuem cron nem dispatch.
+Os workflows podem ser consumidos pelo canal móvel `@v1`, por exemplo
+`owner/repo/.github/workflows/arquivo.yml@v1` no nível de job. A cada push em
+`main` que concluir os checks com sucesso, `update-v1-tag.yml` move
+automaticamente a tag `v1` para o commit validado. A atualização só aceita
+avanço linear da tag; assim os consumidores recebem correções sem alterar seus
+arquivos, sem permitir que uma execução tardia mova `v1` para trás.
+Para ambientes que exigem pin imutável, use o SHA completo no nível de job ou
+de step. Não use `@main` nem `secrets: inherit`. Os workflows compartilhados
+não possuem cron.
 
 O Trivy da validação referencia a action deste repositório por um SHA anterior
 que contém sua implementação. Isso evita uma referência circular ao próprio

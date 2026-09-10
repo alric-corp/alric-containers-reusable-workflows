@@ -17,9 +17,24 @@ class ContractTests(unittest.TestCase):
     def setUp(self):
         self.validation = yaml.safe_load(
             (ROOT / '.github/workflows/validate-apko-images.yml').read_text())
+        self.v1_tag = yaml.safe_load(
+            (ROOT / '.github/workflows/update-v1-tag.yml').read_text())
 
     def test_repository_contracts(self):
         self.assertEqual(check(), [])
+
+    def test_v1_tag_tracks_successful_main_checks(self):
+        self.assertEqual(self.v1_tag['permissions'], {'contents': 'write'})
+        trigger = self.v1_tag[True]['workflow_run']
+        self.assertEqual(trigger['workflows'], ['Reusable workflow checks'])
+        self.assertEqual(trigger['types'], ['completed'])
+        update = self.v1_tag['jobs']['update']
+        self.assertIn('workflow_run.conclusion', update['if'])
+        self.assertIn('workflow_run.head_branch', update['if'])
+        step = update['steps'][0]
+        self.assertEqual(step['env']['TARGET_SHA'], '${{ github.event.workflow_run.head_sha }}')
+        self.assertIn('refs/tags/v1', step['run'])
+        self.assertIn('compare/', step['run'])
 
     def test_pr_validation_cannot_gain_oidc_or_write_permissions(self):
         for permissions in ({'contents': 'write'}, {'contents': 'read', 'id-token': 'write'}):
@@ -30,6 +45,13 @@ class ContractTests(unittest.TestCase):
     def test_shared_workflows_cannot_add_triggers(self):
         self.validation[True]['workflow_dispatch'] = {}
         self.assertTrue(workflow_errors(self.validation, reusable=True))
+
+    def test_validation_uses_the_packaged_catalog_with_legacy_fallback(self):
+        step = next(s for s in self.validation['jobs']['melange-bundle']['steps']
+                    if s.get('name') == 'Validate workflow inputs before privileged operations')
+        self.assertEqual(step['shell'], 'bash')
+        self.assertIn('scripts/pipeline/catalog/validate_inputs.py', step['run'])
+        self.assertIn('.github/scripts/validate_inputs.py', step['run'])
 
     def test_checkout_cannot_switch_to_shared_repository_or_persist_token(self):
         for options in ({'persist-credentials': True},
@@ -78,13 +100,17 @@ class ContractTests(unittest.TestCase):
         self.assertNotIn('continue-on-error', verify)
         self.assertNotIn('TRIVY_VERSION', self.validation.get('env', {}))
 
-    def run_runtime_guard(self, module, framework='nodejs22', run_id='123'):
+    def run_runtime_guard(self, module, framework='nodejs22', run_id='123', legacy=False):
         document = yaml.safe_load((ROOT / '.github/workflows/test-runtime-images.yml').read_text())
         step = next(s for s in document['jobs']['runtime']['steps'] if s.get('id') == 'contract')
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
-            scripts = directory / '.github/scripts'
+            scripts = (directory / '.github/scripts' if legacy
+                       else directory / 'scripts/pipeline/runtime')
             scripts.mkdir(parents=True)
+            if not legacy:
+                for package in (directory / 'scripts', directory / 'scripts/pipeline', scripts):
+                    (package / '__init__.py').write_text('')
             (scripts / 'runtime_images.py').write_text(module)
             output = directory / 'output.txt'
             result = subprocess.run(['bash', '-c', step['run']], cwd=directory,
@@ -101,6 +127,12 @@ class ContractTests(unittest.TestCase):
         result, output = self.run_runtime_guard(module, framework='go1-26')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('dev=go1-26-dev\n', output)
+
+    def test_runtime_guard_keeps_legacy_consumer_layout_compatible(self):
+        result, output = self.run_runtime_guard(
+            'def runtime(f): return ("node", "probe.cjs")\n', legacy=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('dev=\n', output)
 
     def test_runtime_guard_rejects_bad_catalog_input_and_cross_run_injection(self):
         rejected = 'def runtime(f): raise ValueError("framework outside catalog")\n'

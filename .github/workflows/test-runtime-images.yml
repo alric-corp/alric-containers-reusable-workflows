@@ -41,8 +41,12 @@ jobs:
           import os
           import re
           import sys
-          sys.path.insert(0, '.github/scripts')
-          import runtime_images
+          from pathlib import Path
+          if Path('scripts/pipeline/runtime/runtime_images.py').is_file():
+              from scripts.pipeline.runtime import runtime_images
+          else:
+              sys.path.insert(0, '.github/scripts')
+              import runtime_images
           framework = os.environ['FRAMEWORK']
           # API original Node/Python e API estendida dos contratos compilados.
           # Ambas validam o framework; um método ausente/inválido falha alto.
@@ -84,13 +88,19 @@ jobs:
         env:
           FRAMEWORK: ${{ inputs.framework }}
           DEV_FRAMEWORK: ${{ steps.contract.outputs.dev }}
+        shell: bash
         run: |
-          set -eu
-          if [ -n "$DEV_FRAMEWORK" ]; then
-            python3 -B .github/scripts/runtime_images.py candidate.oci "$FRAMEWORK" \
+          set -euo pipefail
+          if [[ -f scripts/pipeline/runtime/runtime_images.py ]]; then
+            runtime_command=(python3 -B -m scripts.pipeline.runtime.runtime_images)
+          else
+            runtime_command=(python3 -B .github/scripts/runtime_images.py)
+          fi
+          if [[ -n "$DEV_FRAMEWORK" ]]; then
+            "${runtime_command[@]}" candidate.oci "$FRAMEWORK" \
               --dev-layout candidate-dev.oci
           else
-            python3 -B .github/scripts/runtime_images.py candidate.oci "$FRAMEWORK"
+            "${runtime_command[@]}" candidate.oci "$FRAMEWORK"
           fi
       - name: Preserve runtime evidence
         if: ${{ !cancelled() }}

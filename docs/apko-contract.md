@@ -46,14 +46,18 @@ Inputs: `framework` (string obrigatória) e `artifact-run-id` (string opcional,
 vazia significa o run atual). O run deve pertencer ao próprio consumidor;
 não existe input para buscar artifacts em outro repositório.
 
-O consumidor fornece `.github/scripts/runtime_images.py`, seus módulos e
-`tests/runtime/`, incluindo probes e projetos multi-stage. O módulo expõe
+O consumidor fornece `scripts/pipeline/runtime/runtime_images.py`, seus módulos
+e `tests/runtime/`, incluindo probes e projetos multi-stage. O módulo expõe
 `supported(framework)` e, para contratos compilados, `project(framework)`.
 A API original Node/Python também é aceita: `runtime(framework)` valida o nome
 e a CLI recebe apenas layout e framework, sem `--dev-layout`.
 Framework desconhecido e run ID
 inválido falham antes de qualquer execução do candidato. A CLI aceita
 `runtime_images.py <layout> <framework> --dev-layout <layout-dev>`.
+
+Durante a migração, o executor também aceita o layout legado
+`.github/scripts/runtime_images.py`; novos consumidores devem adotar o caminho
+em `scripts/pipeline/runtime/`.
 
 Quando houver contrato compilado, a variante `-dev` vem do mesmo run candidato.
 O executor não reconstrói a imagem base; ele pode compilar o projeto de teste

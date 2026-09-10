@@ -9,6 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SHA = re.compile(r'[^@]+@[0-9a-f]{40}')
 EXPRESSION = re.compile(r'\$\{\{.*?\}\}', re.DOTALL)
 REUSABLES = {'validate-apko-images.yml', 'test-runtime-images.yml'}
+V1_TAG_WORKFLOW = 'update-v1-tag.yml'
 
 
 def steps_errors(steps, composite=False):
@@ -67,11 +68,44 @@ def workflow_errors(document, reusable=False):
     return errors
 
 
+def v1_tag_errors(document):
+    errors = []
+    events = document.get('on', document.get(True)) or {}
+    trigger = events.get('workflow_run') or {}
+    if set(events) != {'workflow_run'}:
+        errors.append('v1 tag workflow must run only after reusable CI')
+    if trigger.get('workflows') != ['Reusable workflow checks'] \
+            or trigger.get('types') != ['completed']:
+        errors.append('v1 tag workflow must wait for reusable CI completion')
+    if document.get('permissions') != {'contents': 'write'}:
+        errors.append('v1 tag workflow must have contents write permission only')
+    if document.get('concurrency', {}).get('cancel-in-progress') is not False:
+        errors.append('v1 tag updates must not be cancelled')
+    update = document.get('jobs', {}).get('update', {})
+    condition = update.get('if') or ''
+    if 'workflow_run.conclusion' not in condition or 'workflow_run.head_branch' not in condition:
+        errors.append('v1 tag workflow must require successful main CI')
+    if update.get('timeout-minutes') != 5:
+        errors.append('v1 tag update timeout must be explicit')
+    steps = update.get('steps', [])
+    if not any('refs/tags/v1' in step.get('run', '') for step in steps):
+        errors.append('v1 tag workflow must create or update refs/tags/v1')
+    if not any('compare/' in step.get('run', '') for step in steps):
+        errors.append('v1 tag workflow must reject non-fast-forward updates')
+    if not any(step.get('env', {}).get('TARGET_SHA') == '${{ github.event.workflow_run.head_sha }}'
+               for step in steps):
+        errors.append('v1 tag workflow must target the validated commit')
+    return errors
+
+
 def check(root=ROOT):
     errors = []
     for path in sorted((root / '.github/workflows').glob('*.yml')):
+        document = yaml.safe_load(path.read_text())
         errors += [f'{path.name}: {error}' for error in workflow_errors(
-            yaml.safe_load(path.read_text()), path.name in REUSABLES)]
+            document, path.name in REUSABLES)]
+        if path.name == V1_TAG_WORKFLOW:
+            errors += [f'{path.name}: {error}' for error in v1_tag_errors(document)]
     action = yaml.safe_load((root / 'actions/setup-trivy/action.yml').read_text())
     if action.get('inputs'):
         errors.append('Trivy setup must not accept commands or tool version overrides')
