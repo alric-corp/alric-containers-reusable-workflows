@@ -1,0 +1,90 @@
+# Contract: docs/apko-contract.md. Tests and scripts belong to the caller.
+name: Test candidate OCI runtime contracts
+
+on:
+  workflow_call:
+    inputs:
+      framework:
+        type: string
+        required: true
+      artifact-run-id:
+        description: 'Run containing validated-oci artifacts; empty means the caller run.'
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  runtime:
+    name: Runtime ${{ inputs.framework }} (both architectures)
+    runs-on: ubuntu-latest
+    # Observado local (Docker arm64, amd64 emulado) sobre artifacts reais:
+    # Go 34s, Java 27s, .NET 43s no total das duas plataformas, com o build
+    # multi-stage entre 0,8s e 19,3s. A margem cobre o download do artifact
+    # (até 570 MB na variante -dev do .NET), QEMU no runner hospedado — mais
+    # lento que o Rosetta do Mac — e frameworks compilados futuros.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Resolve contract and required build variant
+        id: contract
+        env:
+          FRAMEWORK: ${{ inputs.framework }}
+          ARTIFACT_RUN_ID: ${{ inputs.artifact-run-id || github.run_id }}
+        run: |
+          set -eu
+          python3 -B - <<'PY'
+          import os
+          import re
+          import sys
+          sys.path.insert(0, '.github/scripts')
+          from runtime_images import supported, project
+          framework = os.environ['FRAMEWORK']
+          kind = supported(framework)
+          if not re.fullmatch(r'[1-9][0-9]*', os.environ['ARTIFACT_RUN_ID']):
+              raise SystemExit('artifact-run-id must be a positive integer')
+          dev = project(framework)[1] if kind == 'compiled' else ''
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'kind={kind}\ndev={dev}\n')
+          PY
+      - name: Set up emulation
+        uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4
+        with:
+          platforms: arm64
+      - name: Download existing candidate OCI
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: validated-oci-${{ inputs.framework }}
+          path: candidate.oci
+          run-id: ${{ inputs.artifact-run-id || github.run_id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+      # Contrato compilado: o estágio de build é a variante -dev do MESMO run,
+      # não uma imagem de registry — o par testado é o par candidato.
+      - name: Download candidate build variant
+        if: steps.contract.outputs.dev != ''
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: validated-oci-${{ steps.contract.outputs.dev }}
+          path: candidate-dev.oci
+          run-id: ${{ inputs.artifact-run-id || github.run_id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+      - name: Test both candidate platforms without rebuilding the base image
+        env:
+          FRAMEWORK: ${{ inputs.framework }}
+        run: |
+          python3 -B .github/scripts/runtime_images.py candidate.oci "$FRAMEWORK" \
+            --dev-layout candidate-dev.oci
+      - name: Preserve runtime evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: runtime-${{ inputs.framework }}-${{ github.run_attempt }}
+          path: reports/runtime-*.json
+          retention-days: 30
+          if-no-files-found: warn
