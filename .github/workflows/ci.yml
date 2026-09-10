@@ -1,0 +1,52 @@
+name: Reusable workflow checks
+
+on:
+  pull_request: {}
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: reusable-checks-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install YAML parser
+        run: python3 -m pip install --quiet PyYAML==6.0.3
+      - name: Test reusable contracts and hardening
+        run: python3 -B -m unittest discover -s tests -v
+  lint-workflows:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: actionlint
+        run: |
+          docker run --rm -v "$PWD":/repo --workdir /repo \
+            rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 \
+            -color .github/workflows/*.yml
+      - name: Install YAML parser
+        run: python3 -m pip install --quiet PyYAML==6.0.3
+      - name: Enforce workflow and action contracts
+        run: python3 -B scripts/check_contracts.py
+  smoke-trivy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Exercise the composite action without AWS
+        uses: ./actions/setup-trivy

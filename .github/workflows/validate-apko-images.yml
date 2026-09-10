@@ -1,0 +1,170 @@
+# Contract: docs/apko-contract.md. Checkout intentionally reads the caller.
+name: Validate Apko base images (no AWS)
+
+on:
+  workflow_call:
+    inputs:
+      frameworks:
+        description: "JSON array de frameworks a validar."
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  # Digests verificados em 08/09/2026; atualizações de ferramentas exigem revisão.
+  APKO_IMAGE: cgr.dev/chainguard/apko@sha256:37e3aa165456e6c55fcded1e11af7ae9b010af914f0b25015c9a4247ec139c67
+  MELANGE_IMAGE: cgr.dev/chainguard/melange@sha256:43d6581e5f04b2f63b842782e581c4e06ff9ea23c81f0b3c8b9967034e38d90b
+
+jobs:
+  melange-bundle:
+    name: Compile certs with melange
+    runs-on: ubuntu-latest
+    # Observado: 21-37s num run real (M14). Timeout generoso pra não
+    # confundir variância normal de rede/runner com um hang de verdade.
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Validate workflow inputs before privileged operations
+        env:
+          FRAMEWORKS: ${{ inputs.frameworks }}
+        run: python3 -B .github/scripts/validate_inputs.py
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4
+        with:
+          platforms: arm64
+
+      - name: Record melange version
+        run: docker run --rm "$MELANGE_IMAGE" version > melange/melange-version.txt
+
+      - name: Generate ephemeral melange signing key
+        working-directory: melange
+        run: |
+          docker run --rm -v "$PWD":/work -w /work "$MELANGE_IMAGE" \
+            keygen melange.rsa
+
+      - name: Build bundle-pem-test package (amd64 + arm64)
+        working-directory: melange
+        run: |
+          set -eu
+          # Cada processo usa uma arquitetura para evitar corrida no workspace
+          # compartilhado (test-dirfs-0 ausente observado no runner real).
+          for ARCH in x86_64 aarch64; do
+            docker run --privileged --rm -v "$PWD":/work -w /work "$MELANGE_IMAGE" \
+              build bundle-pem-test.yaml --arch "$ARCH" --signing-key melange.rsa
+          done
+
+      - name: Upload melange repository
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: melange-repo
+          overwrite: true
+          path: |
+            melange/packages/
+            melange/melange.rsa.pub
+            melange/melange-version.txt
+          retention-days: 1
+
+  validate:
+    name: Validate ${{ matrix.framework }}
+    needs: melange-bundle
+    runs-on: ubuntu-latest
+    # Observado: 21-64s por framework num run real com 16 frameworks (M14).
+    # dotnet8/java21 (SDK/JDK completos) foram os mais lentos observados;
+    # margem cobre frameworks futuros maiores e variância de download.
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        framework: ${{ fromJSON(inputs.frameworks) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Validate workflow inputs before building
+        env:
+          FRAMEWORKS: ${{ inputs.frameworks }}
+        run: python3 -B .github/scripts/validate_inputs.py
+
+      - name: Install pinned apko
+        run: |
+          set -eu
+          docker create --name apko-extract "$APKO_IMAGE"
+          docker cp apko-extract:/usr/bin/apko ./apko
+          docker rm apko-extract
+          chmod +x ./apko
+          ./apko version
+
+      - name: Download melange repository
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: melange-repo
+          path: melange-repo
+
+      - name: Set local image name
+        env:
+          FRAMEWORK: ${{ matrix.framework }}
+        run: echo "IMAGE_NAME=localhost/image-base-${FRAMEWORK}" >> "$GITHUB_ENV"
+
+      - name: Build multi-architecture OCI artifact once
+        env:
+          FRAMEWORK: ${{ matrix.framework }}
+        run: |
+          set -eu
+          mkdir -p "${FRAMEWORK}.oci/sbom"
+          ./apko build --arch x86_64,aarch64 --sbom-path "${FRAMEWORK}.oci/sbom" \
+            --repository-append melange-repo/packages \
+            --keyring-append melange-repo/melange.rsa.pub \
+            "frameworks/${FRAMEWORK}.yaml" "$IMAGE_NAME" "${FRAMEWORK}.oci"
+          python3 -B .github/scripts/oci_artifact.py prepare "${FRAMEWORK}.oci"
+
+      - name: Install Trivy
+        uses: alric-corp/itau-xj7-reusable-workflows/actions/setup-trivy@eea2d2f4c4102ded74204e4131c1417f444ae3fc # governed Trivy setup
+
+      - name: Record validation tool versions
+        run: python3 -B .github/scripts/tool_versions.py validation reports/tool-versions.json
+
+      - name: Scan both architectures
+        env:
+          FRAMEWORK: ${{ matrix.framework }}
+        run: python3 -B .github/scripts/scan_images.py oci "${FRAMEWORK}.oci"
+
+      # M11: o gate acima usa --ignore-unfixed de propósito (bloquear por
+      # algo que ninguém pode corrigir ainda não ajuda) — mas isso deixa
+      # CVEs sem correção completamente invisíveis. Este passo é só
+      # visibilidade: nunca falha o job, roda mesmo se o scan acima já
+      # bloqueou, e nunca esconde a causa real de um bloqueio.
+      - name: Report CVEs without an available fix (informational)
+        if: always()
+        env:
+          FRAMEWORK: ${{ matrix.framework }}
+        run: python3 -B .github/scripts/report_unfixed_cves.py oci "${FRAMEWORK}.oci"
+
+      - name: Preserve scan evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: build-scans-${{ matrix.framework }}-${{ github.run_attempt }}
+          path: reports/
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Preserve validated OCI artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          # Mesmo nome no run: retries do publicador reutilizam a validação
+          # aprovada. Novo conteúdo só substitui o anterior depois do scan.
+          name: validated-oci-${{ matrix.framework }}
+          overwrite: true
+          path: ${{ matrix.framework }}.oci/
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: error

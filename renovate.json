@@ -1,0 +1,26 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "enabledManagers": ["custom.regex"],
+  "automerge": false,
+  "prConcurrentLimit": 4,
+  "timezone": "America/Sao_Paulo",
+  "schedule": ["before 6am on monday"],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "managerFilePatterns": ["/^\\.github/workflows/.*\\.yml$/"],
+      "matchStrings": ["(?<depName>cgr\\.dev/chainguard/(?:apko|melange)|rhysd/actionlint)@(?<currentDigest>sha256:[a-f0-9]{64})"],
+      "datasourceTemplate": "docker",
+      "versioningTemplate": "docker",
+      "currentValueTemplate": "latest"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": ["/^actions/setup-trivy/action\\.yml$/"],
+      "matchStrings": ["TRIVY_VERSION: (?<currentValue>v\\d+\\.\\d+\\.\\d+)"],
+      "depNameTemplate": "aquasecurity/trivy",
+      "datasourceTemplate": "github-releases",
+      "versioningTemplate": "semver"
+    }
+  ]
+}

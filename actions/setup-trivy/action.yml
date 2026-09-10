@@ -1,0 +1,16 @@
+name: Set up the governed Trivy scanner
+description: Install and verify the reviewed Trivy version used by container validation, promotion and recovery.
+runs:
+  using: composite
+  steps:
+    - name: Install pinned Trivy
+      uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
+      env:
+        TRIVY_VERSION: v0.72.0
+      with:
+        version: ${{ env.TRIVY_VERSION }}
+    - name: Verify Trivy installation
+      shell: bash
+      run: |
+        set -euo pipefail
+        trivy --version
