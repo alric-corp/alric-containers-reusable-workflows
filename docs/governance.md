@@ -7,8 +7,8 @@ Administradores também seguem essas regras; force push e exclusão são proibid
 A configuração reproduzível está em `policies/main-protection.json`.
 
 O time `@alric-corp/github_xj7_maintainer` recebe escrita no sandbox e `@vigcf`
-é dono adicional. CODEOWNERS começa a valer quando o arquivo entra na branch
-base; até lá a aprovação independente já é obrigatória na proteção remota.
+é dono adicional. CODEOWNERS já está na `main`; a concessão de escrita ao time
+e a proteção remota tornam a revisão obrigatória efetiva.
 
 Aplicação por um administrador:
 
