@@ -33,7 +33,14 @@ jobs:
       - name: Validate workflow inputs before privileged operations
         env:
           FRAMEWORKS: ${{ inputs.frameworks }}
-        run: python3 -B .github/scripts/validate_inputs.py
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f scripts/pipeline/catalog/validate_inputs.py ]]; then
+            python3 -B -m scripts.pipeline.catalog.validate_inputs
+          else
+            python3 -B .github/scripts/validate_inputs.py
+          fi
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4
@@ -127,7 +134,7 @@ jobs:
           python3 -B .github/scripts/oci_artifact.py prepare "${FRAMEWORK}.oci"
 
       - name: Install Trivy
-        uses: alric-corp/itau-xj7-reusable-workflows/actions/setup-trivy@eea2d2f4c4102ded74204e4131c1417f444ae3fc # governed Trivy setup
+        uses: alric-corp/alric-containers-reusable-workflows/actions/setup-trivy@eea2d2f4c4102ded74204e4131c1417f444ae3fc # governed Trivy setup
 
       - name: Record validation tool versions
         run: python3 -B .github/scripts/tool_versions.py validation reports/tool-versions.json

@@ -1,0 +1,49 @@
+name: Update v1 tag
+
+on:
+  workflow_run:
+    workflows: [Reusable workflow checks]
+    types: [completed]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-v1-tag
+  cancel-in-progress: false
+
+jobs:
+  update:
+    name: Point v1 at validated main
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Move v1 to the published commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TARGET_SHA: ${{ github.event.workflow_run.head_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref="repos/${REPOSITORY}/git/refs/tags/v1"
+          if current_sha="$(gh api "$ref" --jq '.object.sha' 2>/dev/null)"; then
+            if [[ "$current_sha" == "$TARGET_SHA" ]]; then
+              echo "v1 already points to the validated commit"
+              exit 0
+            fi
+            relation="$(gh api "repos/${REPOSITORY}/compare/${current_sha}...${TARGET_SHA}" --jq '.status')"
+            if [[ "$relation" != 'ahead' ]]; then
+              echo "::error::ref v1 is not an ancestor of the validated main commit" >&2
+              exit 1
+            fi
+            gh api --method PATCH "$ref" \
+              -f sha="$TARGET_SHA" -F force=true >/dev/null
+          else
+            gh api --method POST "repos/${REPOSITORY}/git/refs" \
+              -f ref=refs/tags/v1 -f sha="$TARGET_SHA" >/dev/null
+          fi
