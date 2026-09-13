@@ -1,2 +1,7 @@
 __pycache__/
 *.pyc
+
+# Ambiente e preferências pessoais de ferramentas de IA.
+.venv/
+CLAUDE.local.md
+.claude/settings.local.json

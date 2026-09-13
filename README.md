@@ -1,5 +1,9 @@
 # alric-containers-reusable-workflows
 
+Para trabalhar com Codex, Claude Code ou Copilot, consulte o
+[guia de engenharia com IA](docs/ai/README.md) e as
+[instruções compartilhadas](AGENTS.md).
+
 Executores compartilhados para produtos de containers. O primeiro consumidor
 é `alric-corp/alric-containers-image-base`.
 
