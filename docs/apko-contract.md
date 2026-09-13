@@ -1,4 +1,4 @@
-# Contrato Apko/OCI — versão 1
+# Contrato Apko/OCI — versões 1 e 2
 
 Este contrato preserva o protocolo já usado pelo `image-base`. O consumidor
 mantém os scripts porque eles definem o catálogo, os gates e os contratos
@@ -16,7 +16,7 @@ se a entrada não for válida; cada executor da matriz também valida a entrada.
 Arquivos no consumidor:
 
 - `frameworks/<nome>.yaml` e suas inclusões em `distroless/`;
-- `melange/bundle-pem-test.yaml` e os certificados/configurações referenciados;
+- `melange/<melange-config>` (default legado: `bundle-pem-test.yaml`);
 - `.github/scripts/validate_inputs.py`, `oci_artifact.py`, `scan_images.py`,
   `report_unfixed_cves.py`, `tool_versions.py` e seus módulos importados.
 
@@ -30,8 +30,9 @@ correção é informativo; ele não substitui nem neutraliza o gate.
 
 | Artifact | Conteúdo/consumo | Retenção |
 | --- | --- | --- |
-| `melange-repo` | Pacotes, chave pública efêmera e versão Melange | 1 dia |
+| `melange-repo` | Pacotes, chave pública efêmera e versão Melange | 30 dias |
 | `build-scans-<framework>-<attempt>` | Relatórios em `reports/` | 30 dias |
+| `sbom-<framework>-<attempt>` | SPDX original, lock, data/revisão e índice validado | 30 dias |
 | `validated-oci-<framework>` | Layout OCI + índice validado; só existe após sucesso | 3 dias |
 | `runtime-<framework>-<attempt>` | Relatórios `reports/runtime-*.json` | 30 dias |
 
@@ -39,6 +40,22 @@ Um mesmo run deve chamar a validação uma única vez com o lote completo:
 `melange-repo` e `validated-oci-*` são nomes do protocolo compartilhados dentro
 do run. Não chame esta API duas vezes em paralelo no mesmo run.
 Retenção faz parte da API; uma alteração exige atualizar a política do consumidor.
+
+## Composição v2 (opt-in)
+
+`locked-build: true` exige os módulos do consumidor
+`scripts/certificates/prepare_anchors.py verify` e
+`scripts/pipeline/artifacts/build_image.py <framework> <layout>`.
+O primeiro rejeita âncoras não aprovadas antes da operação privilegiada;
+o segundo resolve um lock, builda usando esse lock e a data do commit,
+e registra annotations, SBOMs e insumos de replay. `melange-config` aceita
+somente um nome YAML dentro de `melange/`, validado antes do Docker.
+
+A data do pacote Melange também é fixada pelo commit do consumidor.
+O perfil v1 continua aceito quando `locked-build` é falso. As APIs existentes
+não mudam; a retenção do repositório Melange sobe para 30 dias para permitir
+replay com os mesmos APKs e a chave pública. A disponibilidade de APKs Wolfi
+na origem ainda limita o replay: lockfile não é um mirror de pacotes.
 
 ## Contratos de runtime
 

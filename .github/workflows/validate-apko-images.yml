@@ -9,6 +9,15 @@ on:
         type: string
         required: true
 
+      melange-config:
+        description: "Package filename under melange/; kept compatible with existing callers."
+        type: string
+        default: bundle-pem-test.yaml
+      locked-build:
+        description: "Use caller composition v2 (verified anchors, package lock, fixed date, metadata)."
+        type: boolean
+        default: false
+
 permissions:
   contents: read
 
@@ -47,6 +56,20 @@ jobs:
         with:
           platforms: arm64
 
+      - name: Validate package configuration and trust inputs
+        env:
+          MELANGE_CONFIG: ${{ inputs.melange-config }}
+          LOCKED_BUILD: ${{ inputs.locked-build }}
+        run: |
+          set -euo pipefail
+          [[ "$MELANGE_CONFIG" =~ ^[a-z0-9-]+\.yaml$ ]]
+          test -f "melange/$MELANGE_CONFIG"
+          if [[ "$LOCKED_BUILD" == true ]]; then
+            python3 -B scripts/certificates/prepare_anchors.py verify
+          fi
+          echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" >> "$GITHUB_ENV"
+          echo "BUILD_DATE=$(git show -s --format=%cI HEAD)" >> "$GITHUB_ENV"
+
       - name: Record melange version
         run: docker run --rm "$MELANGE_IMAGE" version > melange/melange-version.txt
 
@@ -56,7 +79,9 @@ jobs:
           docker run --rm -v "$PWD":/work -w /work "$MELANGE_IMAGE" \
             keygen melange.rsa
 
-      - name: Build bundle-pem-test package (amd64 + arm64)
+      - name: Build CA package (amd64 + arm64)
+        env:
+          MELANGE_CONFIG: ${{ inputs.melange-config }}
         working-directory: melange
         run: |
           set -eu
@@ -64,7 +89,7 @@ jobs:
           # compartilhado (test-dirfs-0 ausente observado no runner real).
           for ARCH in x86_64 aarch64; do
             docker run --privileged --rm -v "$PWD":/work -w /work "$MELANGE_IMAGE" \
-              build bundle-pem-test.yaml --arch "$ARCH" --signing-key melange.rsa
+              build "$MELANGE_CONFIG" --arch "$ARCH" --signing-key melange.rsa --build-date "$BUILD_DATE"
           done
 
       - name: Upload melange repository
@@ -76,7 +101,7 @@ jobs:
             melange/packages/
             melange/melange.rsa.pub
             melange/melange-version.txt
-          retention-days: 1
+          retention-days: 30
 
   validate:
     name: Validate ${{ matrix.framework }}
@@ -124,14 +149,31 @@ jobs:
       - name: Build multi-architecture OCI artifact once
         env:
           FRAMEWORK: ${{ matrix.framework }}
+          LOCKED_BUILD: ${{ inputs.locked-build }}
         run: |
           set -eu
+          if [ "$LOCKED_BUILD" = true ]; then
+            python3 -B -m scripts.pipeline.artifacts.build_image "$FRAMEWORK" "${FRAMEWORK}.oci"
+          else
           mkdir -p "${FRAMEWORK}.oci/sbom"
           ./apko build --arch x86_64,aarch64 --sbom-path "${FRAMEWORK}.oci/sbom" \
             --repository-append melange-repo/packages \
             --keyring-append melange-repo/melange.rsa.pub \
             "frameworks/${FRAMEWORK}.yaml" "$IMAGE_NAME" "${FRAMEWORK}.oci"
+          fi
           python3 -B .github/scripts/oci_artifact.py prepare "${FRAMEWORK}.oci"
+
+      - name: Preserve SBOMs and replay inputs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: sbom-${{ matrix.framework }}-${{ github.run_attempt }}
+          path: |
+            ${{ matrix.framework }}.oci/sbom/
+            ${{ matrix.framework }}.oci/apko.lock.json
+            ${{ matrix.framework }}.oci/build-inputs.json
+            ${{ matrix.framework }}.oci/validated-index.json
+          retention-days: 30
+          if-no-files-found: error
 
       - name: Install Trivy
         uses: alric-corp/alric-containers-reusable-workflows/actions/setup-trivy@eea2d2f4c4102ded74204e4131c1417f444ae3fc # governed Trivy setup

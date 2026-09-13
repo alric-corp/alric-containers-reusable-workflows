@@ -79,7 +79,7 @@ class ContractTests(unittest.TestCase):
         self.assertTrue(steps_errors([{'uses': 'owner/action@main'}]))
 
     def test_retention_and_oci_protocol(self):
-        expected = {'melange-repo': 1, 'build-scans-': 30, 'validated-oci-': 3, 'runtime-': 30}
+        expected = {'melange-repo': 30, 'sbom-': 30, 'build-scans-': 30, 'validated-oci-': 3, 'runtime-': 30}
         found = {}
         for name in ('validate-apko-images.yml', 'test-runtime-images.yml'):
             document = yaml.safe_load((ROOT / '.github/workflows' / name).read_text())
