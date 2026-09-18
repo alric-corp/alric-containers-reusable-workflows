@@ -5,7 +5,6 @@ Problema resolvido e comportamento resultante.
 ## Verificação
 
 Comandos executados, resultados e limitações.
-Para mudança não trivial, link para spec e evidence.md em specs/.
 
 ## Risco e revisão
 
