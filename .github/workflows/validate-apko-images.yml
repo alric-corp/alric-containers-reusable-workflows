@@ -176,7 +176,7 @@ jobs:
           if-no-files-found: error
 
       - name: Install Trivy
-        uses: alric-corp/alric-containers-reusable-workflows/actions/setup-trivy@eea2d2f4c4102ded74204e4131c1417f444ae3fc # governed Trivy setup
+        uses: alric-corp/alric-containers-reusable-workflows/actions/setup-trivy@b87bda30545041ddb5d35c345ffc155bbc611dc8 # governed Trivy setup
 
       - name: Record validation tool versions
         run: python3 -B .github/scripts/tool_versions.py validation reports/tool-versions.json
