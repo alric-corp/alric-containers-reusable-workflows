@@ -23,8 +23,8 @@ permissions:
 
 env:
   # Digests verificados em 08/09/2026; atualizações de ferramentas exigem revisão.
-  APKO_IMAGE: cgr.dev/chainguard/apko@sha256:37e3aa165456e6c55fcded1e11af7ae9b010af914f0b25015c9a4247ec139c67
-  MELANGE_IMAGE: cgr.dev/chainguard/melange@sha256:43d6581e5f04b2f63b842782e581c4e06ff9ea23c81f0b3c8b9967034e38d90b
+  APKO_IMAGE: cgr.dev/chainguard/apko@sha256:7fcdcd1ca1fb1e4601fac698458d1b0d6cde7d9e7f0e3cca733aee894889f2e6
+  MELANGE_IMAGE: cgr.dev/chainguard/melange@sha256:15dd85c0e35c099e4142c463d8479da769f319f01ab0f9e6ff427f79d63091f9
 
 jobs:
   melange-bundle:
