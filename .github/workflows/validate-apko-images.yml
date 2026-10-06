@@ -25,6 +25,8 @@ env:
   # Digests verificados em 08/09/2026; atualizações de ferramentas exigem revisão.
   APKO_IMAGE: cgr.dev/chainguard/apko@sha256:7fcdcd1ca1fb1e4601fac698458d1b0d6cde7d9e7f0e3cca733aee894889f2e6
   MELANGE_IMAGE: cgr.dev/chainguard/melange@sha256:15dd85c0e35c099e4142c463d8479da769f319f01ab0f9e6ff427f79d63091f9
+  # HGC-01: registry identity verified on 2026-10-05; no mutable default.
+  BINFMT_IMAGE: docker.io/tonistiigi/binfmt:qemu-v10.2.3-68@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
 
 jobs:
   melange-bundle:
@@ -55,6 +57,71 @@ jobs:
         uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4
         with:
           platforms: arm64
+          image: ${{ env.BINFMT_IMAGE }}
+
+      - name: Record structured binfmt evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+
+          def require(condition, message):
+              if not condition:
+                  raise ValueError(message)
+
+          def docker(*arguments):
+              return subprocess.run(['docker', *arguments], check=True, text=True, capture_output=True)
+
+          requested = os.environ['BINFMT_IMAGE']
+          pin = re.fullmatch(r'docker\.io/tonistiigi/binfmt(?::(?P<tag>[A-Za-z0-9_.-]+))?'
+                             r'@(?P<digest>sha256:[0-9a-f]{64})', requested)
+          require(pin is not None and pin['tag'] != 'latest', 'binfmt must have an explicit immutable digest')
+          inspected = json.loads(docker('image', 'inspect', requested).stdout)
+          require(isinstance(inspected, list) and len(inspected) == 1, 'expected one inspected binfmt image')
+          image = inspected[0]
+          digests = set()
+          for reference in image.get('RepoDigests') or []:
+              repository, separator, digest = reference.partition('@')
+              if repository in ('docker.io/tonistiigi/binfmt', 'tonistiigi/binfmt') and separator:
+                  digests.add(digest)
+          require(digests == {pin['digest']}, 'resolved binfmt digest differs from the requested digest')
+          host = image.get('Os', '') + '/' + image.get('Architecture', '')
+          require(host == 'linux/amd64', 'the hosted binfmt producer must run on linux/amd64')
+          version = docker('run', '--rm', requested, '--version')
+          versions = set(re.findall(r'\bqemu/v?(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)\b',
+                                    version.stdout + version.stderr))
+          require(len(versions) == 1, 'binfmt did not report one QEMU version')
+          status = json.loads(docker('run', '--rm', '--privileged', requested).stdout)
+          require('linux/arm64' in status.get('supported', [])
+                  and 'qemu-aarch64' in status.get('emulators', []), 'required arm64 emulation is unavailable')
+          caller_repository = os.environ['GITHUB_REPOSITORY']
+          repository = caller_repository.lower()
+          require(re.fullmatch(r'[a-z0-9][a-z0-9_.-]*/[a-z0-9][a-z0-9_.-]*', repository), 'invalid producer repository')
+          workflow_ref = os.environ['GITHUB_WORKFLOW_REF']
+          require(workflow_ref.startswith(caller_repository + '/.github/workflows/'), 'unexpected workflow repository')
+          workflow, separator, workflow_revision = workflow_ref[len(caller_repository) + 1:].partition('@')
+          require(separator and workflow_revision and re.fullmatch(r'\.github/workflows/[A-Za-z0-9_.-]+\.ya?ml', workflow),
+                  'unexpected workflow identity')
+          run, attempt = int(os.environ['GITHUB_RUN_ID']), int(os.environ['GITHUB_RUN_ATTEMPT'])
+          require(run > 0 and attempt > 0, 'invalid producer run or attempt')
+          require(re.fullmatch(r'[0-9a-f]{40}', os.environ['GITHUB_SHA']), 'invalid producer source SHA')
+          require(re.fullmatch(r'refs/(?:heads|tags)/[^\s]+|refs/pull/[0-9]+/(?:head|merge)', os.environ['GITHUB_REF'])
+                  and '..' not in os.environ['GITHUB_REF'], 'invalid producer ref')
+          producer = dict(repository=repository, ref=os.environ['GITHUB_REF'], source_sha=os.environ['GITHUB_SHA'],
+                          run_id=run, run_attempt=attempt, release_id=f'r{run}-a{attempt}', workflow=workflow)
+          document = dict(schema_version=1, kind='binfmt-evidence', producer=producer, requested_ref=requested,
+                          requested_digest=pin['digest'], resolved_digest=next(iter(digests)), qemu_version=versions.pop(),
+                          architecture_contract=dict(host_platform=host, emulated_platforms=['linux/arm64'],
+                                                     registered_emulators=['qemu-aarch64'],
+                                                     build_architectures=['aarch64', 'x86_64']))
+          Path('melange/binfmt-evidence.json').write_bytes(
+              json.dumps(document, sort_keys=True, separators=(',', ':'), allow_nan=False).encode())
+          PY
 
       - name: Validate package configuration and trust inputs
         env:
@@ -101,6 +168,7 @@ jobs:
             melange/packages/
             melange/melange.rsa.pub
             melange/melange-version.txt
+            melange/binfmt-evidence.json
           retention-days: 30
 
   validate:
@@ -162,6 +230,8 @@ jobs:
             "frameworks/${FRAMEWORK}.yaml" "$IMAGE_NAME" "${FRAMEWORK}.oci"
           fi
           python3 -B .github/scripts/oci_artifact.py prepare "${FRAMEWORK}.oci"
+          # Keep the original receipt with each candidate; HGC-04 will persist it durably.
+          cp melange-repo/binfmt-evidence.json "${FRAMEWORK}.oci/binfmt-evidence.json"
 
       - name: Preserve SBOMs and replay inputs
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -172,6 +242,7 @@ jobs:
             ${{ matrix.framework }}.oci/apko.lock.json
             ${{ matrix.framework }}.oci/build-inputs.json
             ${{ matrix.framework }}.oci/validated-index.json
+            ${{ matrix.framework }}.oci/binfmt-evidence.json
           retention-days: 30
           if-no-files-found: error
 

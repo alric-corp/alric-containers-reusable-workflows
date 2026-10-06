@@ -30,7 +30,7 @@ correção é informativo; ele não substitui nem neutraliza o gate.
 
 | Artifact | Conteúdo/consumo | Retenção |
 | --- | --- | --- |
-| `melange-repo` | Pacotes, chave pública efêmera e versão Melange | 30 dias |
+| `melange-repo` | Pacotes, chave pública efêmera, versão Melange e receipt binfmt | 30 dias |
 | `build-scans-<framework>-<attempt>` | Relatórios em `reports/` | 30 dias |
 | `sbom-<framework>-<attempt>` | SPDX original, lock, data/revisão e índice validado | 30 dias |
 | `validated-oci-<framework>` | Layout OCI + índice validado; só existe após sucesso | 3 dias |
@@ -40,6 +40,34 @@ Um mesmo run deve chamar a validação uma única vez com o lote completo:
 `melange-repo` e `validated-oci-*` são nomes do protocolo compartilhados dentro
 do run. Não chame esta API duas vezes em paralelo no mesmo run.
 Retenção faz parte da API; uma alteração exige atualizar a política do consumidor.
+
+### HGC-01 — identity binfmt
+
+O input `image` da setup-qemu-action usa a constante `BINFMT_IMAGE`, uma
+referência `docker.io/tonistiigi/binfmt:qemu-v10.2.3-68@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0`.
+O digest do índice multiarch e a tag foram conferidos diretamente no registry
+em 2026-10-05. APKO, Melange e a política Trivy permanecem os mesmos.
+
+Após a instalação, o producer verifica `RepoDigests` da imagem inspecionada,
+exige igualdade com o digest pedido e consulta diretamente o container:
+`--version` fornece a versão QEMU e a saída JSON de status confirma
+`linux/arm64` e `qemu-aarch64`. Não usa o log do workflow como authority.
+Tag sem digest, `latest`, digest divergente, versão ausente e emulação
+indisponível falham antes do build do pacote.
+
+`melange/binfmt-evidence.json` contém bytes JSON canônicos, schema fechado
+v1 e kind `binfmt-evidence`: producer repository/ref/source SHA/run/attempt/
+release ID/workflow, requested ref/digest, resolved digest, QEMU version e
+architecture contract. O producer mantém a identidade real de execuções
+de PR; elas não se tornam evidência nativa de release por normalização.
+O arquivo original viaja no artifact `melange-repo` e é copiado para cada
+layout como `binfmt-evidence.json`, incluindo os artifacts de replay.
+
+Este receipt ainda depende da retenção de artifacts. HGC-04 deverá ancorar
+seus bytes originais em authority durável create-once. O receipt não se
+autoautentica, não autoriza publication, não habilita proving e não fecha o
+gap hospedado sem execução, read-back e revisão. O consumidor só deve
+adotar esta alteração após merge revisado e repin em SHA literal.
 
 ## Composição v2 (opt-in)
 
