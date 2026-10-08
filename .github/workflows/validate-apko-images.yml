@@ -608,7 +608,8 @@ jobs:
               name, version = one(info, 'pkgname'), one(info, 'pkgver')
               require(f'{name}-{version}' == directory.name and one(info, 'arch') == arch, 'cached control stream belongs to another package')
               require(one(info, 'datahash') == sha256(data), 'cached data stream differs from the control datahash')
-              # Only the control and data gzip streams are cached; the signature stream is not, so no full APK is recovered.
+              # The cache keeps the original control and data gzip streams; a signature stream, when the served APK has one,
+              # is not cached.
               return dict(name=name, version=version, arch=arch, control_stream_sha256=sha256(control), control_stream_size=len(control),
                           control_checksum=q1(control), datahash=one(info, 'datahash'), data_stream_sha256=sha256(data),
                           data_stream_size=len(data))
@@ -1039,7 +1040,8 @@ jobs:
               name, version = one(info, 'pkgname'), one(info, 'pkgver')
               require(f'{name}-{version}' == directory.name and one(info, 'arch') == arch, 'cached control stream belongs to another package')
               require(one(info, 'datahash') == sha256(data), 'cached data stream differs from the control datahash')
-              # Only the control and data gzip streams are cached; the signature stream is not, so no full APK is recovered.
+              # The cache keeps the original control and data gzip streams; a signature stream, when the served APK has one,
+              # is not cached.
               return dict(name=name, version=version, arch=arch, control_stream_sha256=sha256(control), control_stream_size=len(control),
                           control_checksum=q1(control), datahash=one(info, 'datahash'), data_stream_sha256=sha256(data),
                           data_stream_size=len(data))
@@ -1140,8 +1142,8 @@ jobs:
               'excluded and verified per build against each ephemeral public key.',
               'Independence is CROSS_JOB_SAME_RUN: another job and runner of the same run, not CROSS_RUN and not an '
               'independent review.',
-              'Dependency identity covers the control and data streams consumed by these two builds; the signature stream is '
-              'not cached, so no complete dependency APK is recovered.',
+              'Dependency identity covers the original control and data streams consumed by these two builds; a signature '
+              'stream of the served APK, when present, is not cached, and the cached streams are not compared with the origin.',
               'Each index is the RESOLUTION_INDEX the pinned tool cached and served to its resolver; no separate '
               'VERIFICATION_INDEX snapshot is consulted.',
               'Keys that apko may discover in a repository are not observable (P1-03); indexes are accepted only when a '
@@ -1305,12 +1307,92 @@ jobs:
           (output / 'melange-reproducibility-evidence.json').write_bytes(canonical(document))
           PY
 
+      # HGC-03 read-back: only the public outputs of this rebuild, derived from
+      # the approved evidence, are copied byte for byte outside melange/.
+      - name: Stage rebuild outputs for external read-back
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+
+
+          def require(condition, message):
+              if not condition:
+                  raise ValueError(message)
+
+
+          def canonical(value):
+              return json.dumps(value, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()
+
+
+          def sha256(data):
+              return hashlib.sha256(data).hexdigest()
+
+
+          temp = Path(os.environ['RUNNER_TEMP'])
+          receipt = temp / 'melange-reproducibility/melange-reproducibility-evidence.json'
+          raw = receipt.read_bytes()
+          evidence = json.loads(raw)
+          require(canonical(evidence) == raw and evidence.get('kind') == 'melange-reproducibility-evidence'
+                  and evidence.get('status') == 'REPRODUCED', 'only an approved canonical evidence is staged')
+          producer = evidence['rebuild']['producer']
+          require(producer['run_id'] == int(os.environ['GITHUB_RUN_ID'])
+                  and producer['run_attempt'] == int(os.environ['GITHUB_RUN_ATTEMPT'])
+                  and producer['job'] == os.environ['GITHUB_JOB'] and producer['runner'] == os.environ['RUNNER_NAME'],
+                  'the evidence was not produced by this rebuild')
+          targets, signed = sorted(evidence['scope']['targets']), evidence['signatures']['rebuild']
+          require(targets and sorted(evidence['rebuild']['outputs']) == targets == sorted(signed['apkindex']),
+                  'evidence targets disagree')
+          # Artifact path -> (sha256, size or None), from the evidence only: never a private key or the cache.
+          expected = {'melange-reproducibility-evidence.json': (sha256(raw), len(raw)),
+                      'rebuild/melange.rsa.pub': (signed['public_key_sha256'], None)}
+          for arch in targets:
+              require(re.fullmatch(r'[a-z0-9_]+', arch), 'unexpected target name')
+              for item in evidence['rebuild']['outputs'][arch]:
+                  require(re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9+._-]*\.apk', item['file']), 'unexpected output name')
+                  expected[f"rebuild/packages/{arch}/{item['file']}"] = (item['apk_sha256'], item['apk_size'])
+              expected[f'rebuild/packages/{arch}/APKINDEX.tar.gz'] = (signed['apkindex'][arch]['sha256'], None)
+          packages, outputs = Path('melange/packages'), set()
+          for path in packages.rglob('*'):
+              require(not path.is_symlink() and (path.is_file() or path.is_dir()), 'rebuild outputs must be regular files')
+              if path.is_file():
+                  outputs.add('rebuild/packages/' + path.relative_to(packages).as_posix())
+          require(outputs == {name for name in expected if name.startswith('rebuild/packages/')},
+                  'rebuild outputs differ from the evidence')
+          sources = {name: packages / name[len('rebuild/packages/'):] for name in outputs}
+          sources.update({'melange-reproducibility-evidence.json': receipt, 'rebuild/melange.rsa.pub': Path('melange/melange.rsa.pub')})
+          staging = temp / 'melange-reproducibility-artifact'
+          staging.mkdir()
+          for name, source in sorted(sources.items()):
+              require(source.is_file() and not source.is_symlink(), f'{name} is not a regular file')
+              target = staging / name
+              target.parent.mkdir(parents=True, exist_ok=True)
+              target.write_bytes(source.read_bytes())
+          staged = {}
+          for path in staging.rglob('*'):
+              require(not path.is_symlink() and (path.is_file() or path.is_dir())
+                      and path.resolve().is_relative_to(staging.resolve()), 'staging must hold only its own regular files')
+              if path.is_file():
+                  staged[path.relative_to(staging).as_posix()] = path.read_bytes()
+          require(set(staged) == set(expected), 'staged files differ from the expected public outputs')
+          for name, (digest, size) in expected.items():
+              require(sha256(staged[name]) == digest and size in (None, len(staged[name])), f'{name} differs from the evidence')
+          require(staged['melange-reproducibility-evidence.json'] == raw and not any(b'PRIVATE KEY' in data for data in staged.values()),
+                  'the staged receipt changed or a private key was staged')
+          PY
+
+      # The receipt keeps its artifact path; rebuild/ adds the public outputs.
       - name: Upload Melange reproducibility evidence
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: melange-reproducibility
           overwrite: true
-          path: ${{ runner.temp }}/melange-reproducibility/melange-reproducibility-evidence.json
+          path: ${{ runner.temp }}/melange-reproducibility-artifact/
           retention-days: 30
           if-no-files-found: error
 
@@ -1430,6 +1512,18 @@ jobs:
                   and all(result['dependencies_equal'] and result['packages'] and all(
                       item['control_stream_equal'] and item['data_stream_equal'] for item in result['packages'])
                       for result in evidence['results'].values()), 'reproducibility results are not all equal')
+          # The approval travels with the public rebuild outputs it describes, and nothing else.
+          rebuild_signatures, preserved = signatures['rebuild'], {}
+          expected = {'melange-reproducibility-evidence.json': hashlib.sha256(raw).hexdigest(),
+                      'rebuild/melange.rsa.pub': rebuild_signatures['public_key_sha256']}
+          for arch in targets:
+              expected.update({f"rebuild/packages/{arch}/{item['file']}": item['apk_sha256'] for item in evidence['rebuild']['outputs'][arch]})
+              expected[f'rebuild/packages/{arch}/APKINDEX.tar.gz'] = rebuild_signatures['apkindex'][arch]['sha256']
+          for path in Path('melange-reproducibility').rglob('*'):
+              require(not path.is_symlink() and (path.is_file() or path.is_dir()), 'reproducibility artifact holds only regular files')
+              if path.is_file():
+                  preserved[path.relative_to('melange-reproducibility').as_posix()] = sha256(path)
+          require(preserved == expected, 'rebuild outputs are not preserved with the evidence')
           PY
 
       - name: Set local image name

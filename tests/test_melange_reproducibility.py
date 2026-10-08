@@ -51,6 +51,7 @@ REFERENCE = step('melange-bundle', 'Capture Melange reproduction reference')
 PREPARE = step('melange-reproduce', 'Prepare reproduction inputs')
 REBUILD_CHOWN = step('melange-reproduce', 'Hand the Melange cache to the runner user')
 RECORD = step('melange-reproduce', 'Record Melange reproducibility evidence')
+STAGE = step('melange-reproduce', 'Stage rebuild outputs for external read-back')
 GATE = step('validate', 'Require reproduced Melange package')
 MELANGE = WORKFLOW['env']['MELANGE_IMAGE']
 BINFMT = WORKFLOW['env']['BINFMT_IMAGE']
@@ -275,7 +276,7 @@ def run_step(outcome, name, definition, cwd, environment):
 def pipeline(reference='hosted-develop', rebuild='local-a1', date=DEVELOP_DATE, world=None, rebuild_world=None, env=None,
              bundle_env=None, reproduce_env=None, validate_env=None, reference_cache=None, rebuild_cache=None,
              reference_outputs=None, rebuild_outputs=None, rebuild_key=None, before_reference=None, transit=None,
-             workspace=None, after_prepare=None, before_gate=None, keep=None):
+             workspace=None, after_prepare=None, before_stage=None, before_gate=None, keep=None):
     """melange-bundle, then melange-reproduce in another workspace and RUNNER_TEMP, then the validate gate."""
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
@@ -291,7 +292,7 @@ def pipeline(reference='hosted-develop', rebuild='local-a1', date=DEVELOP_DATE, 
         git(origin, 'init', '-q')
         git(origin, 'add', '-A')
         git(origin, 'commit', '-q', '-m', 'consumer', date=date)
-        outcome = SimpleNamespace(steps={}, failed=None, sha=git(origin, 'rev-parse', 'HEAD'), github_env={}, capture=None,
+        outcome = SimpleNamespace(steps={}, failed=None, sha=git(origin, 'rev-parse', 'HEAD'), github_env={}, capture=None, staged=None,
                                   evidence=None, diagnostics=None, environment=None, sudo='', docker='')
         base = dict(os.environ, PATH=f"{root / 'bin'}{os.pathsep}{os.environ['PATH']}", TEST_DOCKER_CALLS=str(root / 'calls.jsonl'),
                     TEST_SUDO_CALLS=str(root / 'sudo.txt'), MELANGE_IMAGE=MELANGE, BINFMT_IMAGE=BINFMT, MELANGE_CONFIG=CONFIG,
@@ -308,7 +309,13 @@ def pipeline(reference='hosted-develop', rebuild='local-a1', date=DEVELOP_DATE, 
         shutil.copy(FIXTURES / reference / 'melange.rsa.pub', generated / 'melange.rsa.pub')
         (generated / 'melange.rsa').write_text('ephemeral private key of the reference job (never leaves it)')
         (generated / 'melange-version.txt').write_text('melange\n\nGitVersion:    v0.61.2\n')
-        shutil.copy(FIXTURES / 'hosted-develop/binfmt-evidence.json', generated / 'binfmt-evidence.json')
+        # The hosted HGC-01 receipt with this pipeline's producer, as the bundle job would write it.
+        binfmt = json.loads((FIXTURES / 'hosted-develop/binfmt-evidence.json').read_bytes())
+        run, attempt = int(base['GITHUB_RUN_ID']), int(base['GITHUB_RUN_ATTEMPT'])
+        binfmt['producer'] = dict(repository=base['GITHUB_REPOSITORY'].lower(), ref=base['GITHUB_REF'], source_sha=base['GITHUB_SHA'],
+                                  run_id=run, run_attempt=attempt, release_id=f'r{run}-a{attempt}', workflow='.github/workflows/workflow.yml')
+        outcome.binfmt = canonical(binfmt)
+        (generated / 'binfmt-evidence.json').write_bytes(outcome.binfmt)
         env_a = dict(base, RUNNER_TEMP=str(bundle_temp), GITHUB_ENV=str(bundle_temp / 'github_env'), GITHUB_JOB='melange-bundle',
                      RUNNER_NAME='GitHub Actions 1000000001', TEST_DOCKER_WORLD=str(root / 'world.json'))
         ok = run_step(outcome, 'date', DATE_STEP, bundle, env_a)
@@ -376,13 +383,20 @@ def pipeline(reference='hosted-develop', rebuild='local-a1', date=DEVELOP_DATE, 
         outcome.diagnostics = diagnostics.read_bytes() if diagnostics.exists() else None
         outcome.sudo = Path(base['TEST_SUDO_CALLS']).read_text() if Path(base['TEST_SUDO_CALLS']).exists() else ''
         outcome.docker = Path(base['TEST_DOCKER_CALLS']).read_text()
+        # Read-back staging; the upload sends exactly this directory as melange-reproducibility.
+        staging = rebuild_temp / 'melange-reproducibility-artifact'
+        if ok and before_stage:
+            before_stage(rebuild_root, rebuild_temp)
+        ok = ok and run_step(outcome, 'stage', STAGE, rebuild_root, env_b)
+        if ok:
+            outcome.staged = {path.relative_to(staging).as_posix(): path.read_bytes()
+                              for path in sorted(staging.rglob('*')) if path.is_file()}
 
         # validate: the gate before any candidate is built.
-        if outcome.evidence is not None:
+        if ok:
             validate = root / 'validate'
             shutil.copytree(repo, validate / 'melange-repo')
-            (validate / 'melange-reproducibility').mkdir()
-            shutil.copy(evidence, validate / 'melange-reproducibility')
+            shutil.copytree(staging, validate / 'melange-reproducibility')
             if before_gate:
                 before_gate(validate)
             run_step(outcome, 'gate', GATE, validate, dict(base, GITHUB_JOB='validate', **(validate_env or {})))
@@ -390,6 +404,11 @@ def pipeline(reference='hosted-develop', rebuild='local-a1', date=DEVELOP_DATE, 
                 outcome.validate = keep / 'validate'
                 shutil.copytree(validate, outcome.validate)
                 outcome.github = {name: value for name, value in base.items() if name.startswith('GITHUB_')}
+                # The three artifacts as an external auditor downloads them.
+                outcome.artifacts = keep / 'artifacts'
+                shutil.copytree(repo, outcome.artifacts / 'melange-repo')
+                shutil.copytree(artifacts / 'capture', outcome.artifacts / 'melange-reproduction-reference')
+                shutil.copytree(staging, outcome.artifacts / 'melange-reproducibility')
         return outcome
 
 
@@ -463,7 +482,8 @@ class Reproduction(unittest.TestCase):
         order = ['Download reference melange repository', 'Download Melange reproduction reference',
                  'Prepare reproduction inputs', 'Generate ephemeral melange signing key', 'Build CA package (amd64 + arm64)',
                  'Hand the Melange cache to the runner user', 'Record Melange reproducibility evidence',
-                 'Upload Melange reproducibility evidence', 'Preserve reproducibility diagnostics']
+                 'Stage rebuild outputs for external read-back', 'Upload Melange reproducibility evidence',
+                 'Preserve reproducibility diagnostics']
         self.assertEqual([names.index(name) for name in order], sorted(names.index(name) for name in order))
         for name in order[:2]:
             self.assertTrue(step('melange-reproduce', name)['with']['path'].startswith('${{ runner.temp }}/reproduction-reference/'))
@@ -476,7 +496,7 @@ class Reproduction(unittest.TestCase):
                         validate_names.index('Build multi-architecture OCI artifact once'))
         downloads = [s['with']['name'] for s in validate['steps'] if s.get('uses', '').startswith('actions/download-artifact@')]
         self.assertEqual(downloads, ['melange-repo', 'melange-reproducibility'])
-        for definition in (GATE, RECORD, step('melange-reproduce', 'Upload Melange reproducibility evidence')):
+        for definition in (GATE, RECORD, STAGE, step('melange-reproduce', 'Upload Melange reproducibility evidence')):
             self.assertNotIn('if', definition)
             self.assertNotIn('continue-on-error', definition)
         upload = step('melange-reproduce', 'Upload Melange reproducibility evidence')['with']
@@ -1002,7 +1022,7 @@ class Reproduction(unittest.TestCase):
 
     def test_evidence_propagates_without_byte_changes(self):
         upload = step('melange-reproduce', 'Upload Melange reproducibility evidence')['with']
-        self.assertEqual(upload['path'], '${{ runner.temp }}/melange-reproducibility/melange-reproducibility-evidence.json')
+        self.assertEqual(upload['path'], '${{ runner.temp }}/melange-reproducibility-artifact/')
         download = step('validate', 'Download Melange reproducibility evidence')['with']
         self.assertEqual((download['name'], download['path']), (upload['name'], 'melange-reproducibility'))
         build = step('validate', 'Build multi-architecture OCI artifact once')['run']
@@ -1021,8 +1041,7 @@ class Reproduction(unittest.TestCase):
             self.assertEqual((root / 'go1-26.oci/melange-reproducibility-evidence.json').read_bytes(), self.default.evidence)
         # The receipts in the evidence are the hashes of the original HGC-01/HGC-02 bytes that travel unchanged.
         evidence = json.loads(self.default.evidence)
-        self.assertEqual(evidence['receipts']['binfmt_evidence'],
-                         sha256((FIXTURES / 'hosted-develop/binfmt-evidence.json').read_bytes()))
+        self.assertEqual(evidence['receipts']['binfmt_evidence'], sha256(self.default.binfmt))
         self.assertEqual(evidence['receipts']['melange_environment_evidence'], sha256(self.default.environment))
         self.assertEqual(evidence['receipts']['reproduction_reference'], sha256(self.default.capture))
 

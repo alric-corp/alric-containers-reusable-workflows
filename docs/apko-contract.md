@@ -32,7 +32,7 @@ correção é informativo; ele não substitui nem neutraliza o gate.
 | --- | --- | --- |
 | `melange-repo` | Pacotes, chave pública efêmera, versão Melange, receipt binfmt e evidência do ambiente Melange | 30 dias |
 | `melange-reproduction-reference` | Captura HGC-03 do build de referência (data exata, materiais e índices das dependências) | 30 dias |
-| `melange-reproducibility` | Evidência HGC-03 aprovada; só existe com status `REPRODUCED` | 30 dias |
+| `melange-reproducibility` | Evidência HGC-03 aprovada (raiz) e saídas públicas do rebuild em `rebuild/`; só existe com status `REPRODUCED` | 30 dias |
 | `melange-reproducibility-diagnostics-<attempt>` | Diagnóstico de rebuild reprovado; nunca alimenta a validação | 30 dias |
 | `build-scans-<framework>-<attempt>` | Relatórios em `reports/` | 30 dias |
 | `sbom-<framework>-<attempt>` | SPDX original, lock, data/revisão e índice validado | 30 dias |
@@ -175,8 +175,15 @@ arquitetura, repositório, SHA-256 e tamanho do stream de controle, `C:`/Q1,
 `datahash`, SHA-256 e tamanho do stream de dados, o índice usado e as
 verificações. O inventário precisa ser igual ao lock nome/versão de cada
 target, sem faltas, extras ou streams de outro pacote (`.PKGINFO` confere
-nome, versão e arch). O cache guarda só controle e dados: o APK original
-completo da dependência não é recuperado.
+nome, versão e arch). O adapter captura os streams originais de controle e
+de dados que a ferramenta gravou no cache. Num APK servido sem stream de
+assinatura, esses dois streams são o arquivo inteiro; num APK com stream de
+assinatura, esse terceiro stream não fica no cache e o APK completo não é
+recuperado. Os builds não comparam os streams do cache com o APK da origem.
+Na auditoria do run 37787314179 do consumidor, os 18 APKs de dependência
+servidos pelo Wolfi (snapshot posterior ao build) tinham dois streams, e
+controle seguido de dados era igual aos bytes servidos; isso é uma observação
+daquele snapshot, não uma garantia para outras versões ou repositórios.
 
 **Índice.** O `APKINDEX` lido é o `RESOLUTION_INDEX`: o arquivo que o próprio
 go-apk baixou, gravou no cache e serve ao resolvedor do build, não um índice
@@ -235,14 +242,67 @@ parâmetro e ausência de `SOURCE_DATE_EPOCH` no processo) e identidade material
 das dependências por target. Ficam fora chaves, producers, índices (mudam com
 o tempo), verificações e resultados. O arquivo é copiado sem reserialização
 para `<framework>.oci/` e para o artifact de replay; nenhuma chave privada sai
-do job que a gerou.
+do job que a gerou. Em `limits`, o item sobre dependências passou a dizer que
+um stream de assinatura do APK servido, quando existe, não fica no cache, e
+que os streams não são comparados com a origem; receipts anteriores mantêm o
+texto antigo. `limits` não faz parte de `reproduction_inputs`: o digest e o
+resultado não mudam.
+
+**Read-back externo.** Depois do `Record`, `Stage rebuild outputs for
+external read-back` monta `$RUNNER_TEMP/melange-reproducibility-artifact/`
+(fora de `melange/`) a partir da evidência aprovada, e o upload envia só esse
+diretório como `melange-reproducibility`:
+
+```text
+melange-reproducibility-evidence.json        (mesmo caminho de antes)
+rebuild/melange.rsa.pub                      (chave pública efêmera do rebuild)
+rebuild/packages/<arch>/<output>.apk         (cada output de rebuild.outputs)
+rebuild/packages/<arch>/APKINDEX.tar.gz      (índice dos pacotes produzidos)
+```
+
+O conjunto esperado vem da evidência: arquivos de `rebuild.outputs`
+(SHA-256 e tamanho), `signatures.rebuild.apkindex` (SHA-256 de cada
+`APKINDEX` dos pacotes produzidos, não os `RESOLUTION_INDEX` do Wolfi) e
+`signatures.rebuild.public_key_sha256`. O staging exige evidência canônica
+`REPRODUCED` deste run, attempt, job e runner; outputs reais de
+`melange/packages` iguais a esse conjunto, só arquivos regulares, sem
+symlinks; nomes de output restritos a `*.apk` sem diretórios; cópia byte a
+byte e, depois da cópia, o conjunto e os hashes do diretório preparado iguais
+ao esperado, inclusive o receipt idêntico ao original. `melange.rsa`, o cache e
+qualquer outro arquivo ficam fora porque só a lista derivada é copiada.
+Falha no staging ou no upload falha o job e `validate` não roda. O gate de
+`validate` exige que o artifact baixado contenha exatamente esses arquivos com
+esses hashes; o build OCI continua copiando só o receipt.
+
+`scripts/verify_reproducibility.py` refaz a verificação a partir dos três
+artifacts baixados (`melange-repo`, `melange-reproduction-reference`,
+`melange-reproducibility`) e da identidade do run obtida pela API, sem
+build, chave privada, credencial ou acesso ao Wolfi:
+
+```sh
+python3 scripts/verify_reproducibility.py --melange-repo melange-repo \
+  --reference melange-reproduction-reference --reproducibility melange-reproducibility \
+  --repository <owner/repo> --run-id <run> --run-attempt <attempt> --source-sha <sha> --ref <ref>
+```
+
+Ele confere producers e vínculos dos receipts, JSON canônico, o
+`reproduction_input_digest` recalculado a partir dos receipts, os APKs de
+referência contra o HGC-02 e os do rebuild contra a evidência, as chaves
+públicas e os `APKINDEX`, as assinaturas RSA-SHA256 de cada APK e índice com a
+chave do próprio build, a coerência de cada `APKINDEX` com seus outputs,
+`builddate`/SBOM com a string registrada, e compara diretamente os bytes dos
+streams de controle e de dados. Não usa os booleanos `verified`/`equal` da
+evidência. Os workflows não chamam esse arquivo: o checkout dos jobs é do
+caller.
 
 **Limites.** A independência é `CROSS_JOB_SAME_RUN` (outro job e runner, mesmo
 `run_id`), não `CROSS_RUN`, e não equivale a revisão independente. Hashes
 registrados não garantem replay futuro, mirror ou disponibilidade dos pacotes
 Wolfi. A evidência vive em artifacts de workflow; a custódia durável é do
 HGC-04. Probes locais com a ferramenta real não são prova hospedada. Status:
-`HGC03_STATUS = IMPLEMENTED`, `HGC03_HOSTED_PROOF = NOT_PROVEN`.
+`HGC03_STATUS = HOSTED_PROVEN` pelo run 37787314179 do consumidor (reusable
+`e508aa2`); a preservação dos outputs do rebuild para read-back externo ainda
+não tem prova hospedada.
 
 ## Composição v2 (opt-in)
 
