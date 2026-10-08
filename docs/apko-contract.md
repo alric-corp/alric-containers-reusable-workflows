@@ -31,14 +31,17 @@ correção é informativo; ele não substitui nem neutraliza o gate.
 | Artifact | Conteúdo/consumo | Retenção |
 | --- | --- | --- |
 | `melange-repo` | Pacotes, chave pública efêmera, versão Melange, receipt binfmt e evidência do ambiente Melange | 30 dias |
+| `melange-reproduction-reference` | Captura HGC-03 do build de referência (data exata, materiais e índices das dependências) | 30 dias |
+| `melange-reproducibility` | Evidência HGC-03 aprovada; só existe com status `REPRODUCED` | 30 dias |
+| `melange-reproducibility-diagnostics-<attempt>` | Diagnóstico de rebuild reprovado; nunca alimenta a validação | 30 dias |
 | `build-scans-<framework>-<attempt>` | Relatórios em `reports/` | 30 dias |
 | `sbom-<framework>-<attempt>` | SPDX original, lock, data/revisão e índice validado | 30 dias |
 | `validated-oci-<framework>` | Layout OCI + índice validado; só existe após sucesso | 3 dias |
 | `runtime-<framework>-<attempt>` | Relatórios `reports/runtime-*.json` | 30 dias |
 
 Um mesmo run deve chamar a validação uma única vez com o lote completo:
-`melange-repo` e `validated-oci-*` são nomes do protocolo compartilhados dentro
-do run. Não chame esta API duas vezes em paralelo no mesmo run.
+`melange-repo`, `melange-reproduction-reference`, `melange-reproducibility` e
+`validated-oci-*` são nomes do protocolo compartilhados dentro do run. Não chame esta API duas vezes em paralelo no mesmo run.
 Retenção faz parte da API; uma alteração exige atualizar a política do consumidor.
 
 ### HGC-01 — identity binfmt
@@ -110,6 +113,136 @@ para cada layout e artifact de replay como `melange-environment-evidence.json`.
 Status: `HGC02_STATUS = IMPLEMENTED`, `PROVING_STATUS = NONE`; a prova
 hospedada depende de merge revisado e repin do consumidor, e a persistência
 durável continua com o HGC-04.
+
+**Correção (HGC-03).** A análise do HGC-02 (PR #13) registrou que
+`--apk-cache-dir` só continha streams expandidos em diretórios temporários de
+nome aleatório. Estava errado: a listagem usada (`find -type f`) omitiu os
+nomes endereçados por conteúdo, que são symlinks (`<sha1>.ctl.tar.gz`,
+`<sha256>.dat.tar.gz`, `<sha256>.dat.tar`) para os streams de controle e de
+dados guardados em `expand-apk*/`. Continua correto que o HGC-02 não capturava
+checksums materiais das dependências e que os outputs usados por ele (lock,
+`.PKGINFO`, `APKINDEX`, SBOM, SLSA) não os expõem. Novos builds podem capturar
+essa identidade pelo cache (HGC-03); os runs históricos, inclusive
+37614260125, 37729369156 e 37731450779, continuam com
+`DEPENDENCY_MATERIAL_IDENTITY = NOT_PROVEN`. O `environment_digest` não muda:
+continua sem a data do build, a chave de assinatura e os materiais; a
+identidade de reprodução do HGC-03 é adicional.
+
+### HGC-03 — reprodutibilidade do pacote CA
+
+**Igualdade.** Para o pacote de `melange/<melange-config>` em `x86_64` e
+`aarch64`, um rebuild em outro job e outro runner do mesmo run, com os mesmos
+arquivos de origem, configuração, Melange e binfmt pinados, string exata de
+`BUILD_DATE` e materiais de dependência idênticos, precisa produzir os mesmos
+bytes originais dos streams de controle e de dados de cada APK. Nada é
+normalizado antes da comparação (tar, gzip, timestamps, SBOM, `.PKGINFO`).
+Ficam fora da igualdade o stream de assinatura, o `APKINDEX` e o APK assinado
+completo, porque cada build usa sua própria chave efêmera; ainda assim cada
+build verifica a assinatura RSA-SHA256 dos seus APKs e do seu `APKINDEX` com a
+sua chave pública, e o `APKINDEX` precisa descrever exatamente os APKs do
+próprio build (`C:` e `S:`). Não é uma afirmação sobre o Melange em geral nem
+sobre o catálogo; payloads com mais de um bloco pgzip não foram exercitados.
+
+**Data.** `BUILD_DATE` continua vindo de `git show -s --format=%cI HEAD`. A
+string RFC3339 completa, com offset, é input: o mesmo instante escrito em UTC
+produz outros bytes (`created` do SBOM e mtimes). A captura registra a string,
+a origem e o commit, o `SOURCE_DATE_EPOCH` do host (`%ct`, exigido igual ao
+mesmo instante), a presença dessa variável no processo Melange e o parâmetro
+aplicado. O Melange v0.61.2 deixa `SOURCE_DATE_EPOCH` do próprio processo
+sobrescrever `--build-date` (`pkg/build/build.go`); o `docker run` não passa
+`-e`/`--env` e cada job confere por `docker image inspect` que a `Config.Env`
+da imagem pinada não a define, logo o registro é `absent` e o parâmetro é
+`--build-date`, confirmado nos outputs (`builddate` igual ao epoch e `created`
+igual à string exata). O rebuild recebe a string registrada e só a aceita se
+for o `%cI` do mesmo commit. Nenhuma data é normalizada nem tirada do relógio.
+
+**Materiais das dependências.** O step de build, com o mesmo texto nos dois
+jobs, monta `--apk-cache-dir` em `$RUNNER_TEMP/melange-apk-cache`: vazio no
+início de cada job, fora de `melange/`, dos arquivos de origem e do
+`environment_digest`. O adapter lê apenas o layout observado do go-apk do apko
+v1.4.6 embutido no Melange pinado e falha com qualquer outra estrutura:
+`<repositório url-escaped>/<arch>/APKINDEX/<n>.tmp` com um symlink
+`<etag>.tar.gz`, e `<repositório>/<arch>/<nome>-<versão>/expand-apk<n>/` com
+`stream-0.tar.gz` (controle), `stream-1.tar.gz` (dados) e `stream-1.tar`
+(dados expandidos), anunciados por três symlinks endereçados por conteúdo.
+Esses symlinks são tratados à parte da origem (a rejeição de symlinks em
+`melange/` do HGC-02 continua): precisam ser relativos, resolver dentro do
+diretório do próprio pacote ou índice e apontar para o stream esperado; o nome
+nunca é prova, os SHA-1/SHA-256 são recalculados dos bytes. Como o Melange roda
+como root, `sudo chown -hR` entrega o cache ao usuário do runner sem seguir
+symlinks. Para cada dependência consumida são registrados nome, versão,
+arquitetura, repositório, SHA-256 e tamanho do stream de controle, `C:`/Q1,
+`datahash`, SHA-256 e tamanho do stream de dados, o índice usado e as
+verificações. O inventário precisa ser igual ao lock nome/versão de cada
+target, sem faltas, extras ou streams de outro pacote (`.PKGINFO` confere
+nome, versão e arch). O cache guarda só controle e dados: o APK original
+completo da dependência não é recuperado.
+
+**Índice.** O `APKINDEX` lido é o `RESOLUTION_INDEX`: o arquivo que o próprio
+go-apk baixou, gravou no cache e serve ao resolvedor do build, não um índice
+consultado depois. A assinatura é verificada com o arquivo do keyring
+declarado (`.SIGN.RSA256.<arquivo>`, SHA-256 do receipt HGC-02) e a entrada
+nome/versão/arch precisa existir uma única vez com `C:` igual ao Q1 do controle
+consumido. Nenhum `VERIFICATION_INDEX` separado é consultado. A origem é
+demonstrada pelo mecanismo da ferramenta pinada, não por atestado do
+repositório; chaves que o apko descubra no repositório continuam o P1-03.
+
+**Jobs e gate.** No `melange-bundle`, depois do receipt HGC-02, `Capture
+Melange reproduction reference` grava em `RUNNER_TEMP` a captura
+`melange-reproduction-reference.json` (kind `melange-reproduction-reference`:
+producer com job e runner, SHA-256 dos receipts HGC-01/HGC-02, parâmetros
+temporais, materiais e índices), publicada em artifact próprio sem alterar
+`melange-repo`. O novo job `melange-reproduce` baixa `melange-repo` e a
+captura para `RUNNER_TEMP`, fora do workspace; `Prepare reproduction inputs`
+exige JSON canônico, kinds, binding por hash, mesmo repositório, ref, SHA e
+run, attempt da referência menor ou igual ao atual, outro job, a mesma árvore
+`melange/`, a mesma configuração e imagem, e exporta a string registrada.
+O job gera nova chave efêmera, roda o mesmo step de build e `Record Melange
+reproducibility evidence` reconfere a ferramenta (digest, plataforma, versão),
+o binfmt (digest), as assinaturas dos dois builds, o lock do rebuild e os
+materiais, e compara. Status:
+
+- `REPRODUCED`: materiais iguais e controle/dados iguais;
+- `INPUTS_DIFFER`: os materiais diferem (por exemplo, o Wolfi publicou outra
+  versão entre os jobs); não é falha de determinismo do mesmo build. Um
+  re-run só dos jobs com falha reaproveita a referência do attempt anterior;
+  para capturar uma referência nova é preciso re-executar todos os jobs;
+- `OUTPUTS_DIFFER_WITH_EQUAL_RECORDED_INPUTS`: materiais iguais e streams
+  diferentes;
+- `NOT_INDEPENDENT`: mesmo runner ou job da referência.
+
+Só `REPRODUCED` gera `melange-reproducibility-evidence.json`; os outros
+status gravam diagnóstico (`melange-reproducibility-diagnostics-<attempt>`) e
+falham o job. Isso muda o comportamento operacional: `validate` passa a
+depender de `melange-bundle` e `melange-reproduce`, e `Require reproduced
+Melange package` roda antes do build OCI. O gate exige evidência canônica
+`REPRODUCED` e `CROSS_JOB_SAME_RUN`, receipts iguais aos bytes de
+`melange-repo`, mesmo repositório, SHA, ref e run, attempts até o atual,
+runner e job distintos, digest recalculado, APKs candidatos iguais aos da
+referência, assinaturas verificadas e todos os resultados iguais. Falha ou
+ausência bloqueia os candidatos; diagnóstico nunca vira aprovação. Publicador,
+política Trivy e promoção não mudam.
+
+**Evidência.** `melange-reproducibility-evidence.json`: schema fechado v1,
+kind `melange-reproducibility-evidence`, JSON canônico. Seções: `reference`
+(A, build de referência), `rebuild` (B), `reproduction_inputs` e
+`reproduction_input_digest` (C), `results` (D), `signatures` (E), `limits`
+(F), além de `scope` e `receipts` (SHA-256 dos bytes dos receipts HGC-01,
+HGC-02 e da captura, e o `environment_digest`). `reproduction_input_digest` é
+o SHA-256 canônico de `reproduction_inputs`: ferramenta, host, binfmt,
+configuração, arquivos de origem, repositórios, keyring, data (string exata,
+parâmetro e ausência de `SOURCE_DATE_EPOCH` no processo) e identidade material
+das dependências por target. Ficam fora chaves, producers, índices (mudam com
+o tempo), verificações e resultados. O arquivo é copiado sem reserialização
+para `<framework>.oci/` e para o artifact de replay; nenhuma chave privada sai
+do job que a gerou.
+
+**Limites.** A independência é `CROSS_JOB_SAME_RUN` (outro job e runner, mesmo
+`run_id`), não `CROSS_RUN`, e não equivale a revisão independente. Hashes
+registrados não garantem replay futuro, mirror ou disponibilidade dos pacotes
+Wolfi. A evidência vive em artifacts de workflow; a custódia durável é do
+HGC-04. Probes locais com a ferramenta real não são prova hospedada. Status:
+`HGC03_STATUS = IMPLEMENTED`, `HGC03_HOSTED_PROOF = NOT_PROVEN`.
 
 ## Composição v2 (opt-in)
 

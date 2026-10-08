@@ -1,0 +1,33 @@
+# Public roots come from Wolfi's ca-certificates-bundle. Only reviewed
+# organization anchors belong here; never duplicate the Mozilla bundle.
+package:
+  name: image-base-ca-certificates
+  version: 1.0.0
+  epoch: 0
+  description: Reviewed additional CA anchors and their trust manifest
+  copyright:
+    - license: NOASSERTION
+  dependencies:
+    provides:
+      - custom-ca-certificates
+
+environment:
+  contents:
+    repositories:
+      - https://packages.wolfi.dev/os
+    keyring:
+      - keys/wolfi-signing.rsa.pub
+    packages:
+      - busybox
+
+pipeline:
+  - name: Install individual CA anchors and manifest
+    runs: |
+      set -eu
+      install -d "${{targets.destdir}}/usr/local/share/ca-certificates"
+      install -d "${{targets.destdir}}/usr/share/image-base"
+      install -m 0644 certificates/manifest.json "${{targets.destdir}}/usr/share/image-base/ca-certificates.json"
+      for certificate in certificates/anchors/*.crt; do
+        [ -f "$certificate" ] || continue
+        install -m 0644 "$certificate" "${{targets.destdir}}/usr/local/share/ca-certificates/"
+      done
