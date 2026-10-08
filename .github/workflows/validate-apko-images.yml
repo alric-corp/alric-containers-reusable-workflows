@@ -224,17 +224,23 @@ jobs:
           Path(os.environ['RUNNER_TEMP'], 'melange-environment-inputs.json').write_text(json.dumps(capture))
           PY
 
+      # HGC-03: same text in both jobs. The dependency cache of the pinned
+      # tool stays outside melange/, so it is neither a source file nor part
+      # of the HGC-02 environment; it starts empty in each job.
       - name: Build CA package (amd64 + arm64)
         env:
           MELANGE_CONFIG: ${{ inputs.melange-config }}
         working-directory: melange
         run: |
           set -eu
+          mkdir "$RUNNER_TEMP/melange-apk-cache"
           # Cada processo usa uma arquitetura para evitar corrida no workspace
           # compartilhado (test-dirfs-0 ausente observado no runner real).
           for ARCH in x86_64 aarch64; do
-            docker run --privileged --rm -v "$PWD":/work -w /work "$MELANGE_IMAGE" \
-              build "$MELANGE_CONFIG" --arch "$ARCH" --signing-key melange.rsa --build-date "$BUILD_DATE"
+            docker run --privileged --rm -v "$PWD":/work -w /work \
+              -v "$RUNNER_TEMP/melange-apk-cache":/apk-cache "$MELANGE_IMAGE" \
+              build "$MELANGE_CONFIG" --arch "$ARCH" --signing-key melange.rsa --build-date "$BUILD_DATE" \
+              --apk-cache-dir /apk-cache
           done
 
       # HGC-02: the environment is Melange's own lock (.melange.yaml in every
@@ -446,6 +452,283 @@ jobs:
           Path('melange/melange-environment-evidence.json').write_bytes(canonical(document))
           PY
 
+      # HGC-03: Melange runs as root and leaves root-only cache directories;
+      # -h changes the cache symlinks themselves and never follows them.
+      - name: Hand the Melange cache to the runner user
+        run: sudo chown -hR "$(id -u):$(id -g)" "$RUNNER_TEMP/melange-apk-cache"
+
+      # HGC-03: after the HGC-02 receipt, outside melange/. Binds the exact
+      # BUILD_DATE string and the dependency materials the pinned tool cached.
+      - name: Capture Melange reproduction reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B - <<'PY'
+          import base64
+          import datetime
+          import gzip
+          import hashlib
+          import io
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import tarfile
+          import tempfile
+          import urllib.parse
+          import zlib
+
+          # --- HGC-03 shared helpers: byte-identical in both jobs (tests enforce it) ---
+          TARGETS = {'aarch64': 'arm64', 'x86_64': 'amd64'}
+
+
+          def require(condition, message):
+              if not condition:
+                  raise ValueError(message)
+
+
+          def canonical(value):
+              return json.dumps(value, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()
+
+
+          def sha256(data):
+              return hashlib.sha256(data).hexdigest()
+
+
+          def q1(control):
+              return 'Q1' + base64.b64encode(hashlib.sha1(control).digest()).decode()
+
+
+          def epoch(value):
+              require(re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:\d{2})', value),
+                      'BUILD_DATE must be an RFC3339 second-precision timestamp')
+              return int(datetime.datetime.fromisoformat(value.replace('Z', '+00:00')).timestamp())
+
+
+          def streams(raw):
+              parts, offset = [], 0
+              while offset < len(raw):
+                  stream = zlib.decompressobj(31)
+                  stream.decompress(raw[offset:])
+                  require(stream.eof, 'truncated gzip stream')
+                  used = len(raw) - offset - len(stream.unused_data)
+                  parts.append(raw[offset:offset + used])
+                  offset += used
+              return parts
+
+
+          def members(stream):
+              with tarfile.open(fileobj=io.BytesIO(gzip.decompress(stream))) as archive:
+                  return {entry.name: archive.extractfile(entry).read() for entry in archive.getmembers() if entry.isfile()}
+
+
+          def pkginfo(control):
+              entries = members(control)
+              require('.PKGINFO' in entries, 'control stream lacks .PKGINFO')
+              info = {}
+              for line in entries['.PKGINFO'].decode().splitlines():
+                  if line and not line.startswith('#'):
+                      key, found, value = line.partition(' = ')
+                      require(found, 'malformed .PKGINFO')
+                      info.setdefault(key, []).append(value)
+              return entries, info
+
+
+          def one(values, key):
+              require(len(values.get(key, [])) == 1, f'package metadata must contain exactly one {key}')
+              return values[key][0]
+
+
+          def apkindex(stream):
+              index = {}
+              for block in members(stream).get('APKINDEX', b'').decode().strip().split('\n\n'):
+                  entry = {}
+                  for line in block.splitlines():
+                      key, found, value = line.partition(':')
+                      require(found and len(key) == 1 and key not in entry, 'malformed APKINDEX entry')
+                      entry[key] = value
+                  index.setdefault((entry.get('P'), entry.get('V'), entry.get('A')), []).append(entry)
+              return index
+
+
+          def verify(signature_stream, payload, key_file, key_name):
+              entries = members(signature_stream)
+              require(sorted(entries) == ['.SIGN.RSA256.' + key_name], f'expected one signature by {key_name}')
+              with tempfile.TemporaryDirectory() as temporary:
+                  Path(temporary, 'signature').write_bytes(entries['.SIGN.RSA256.' + key_name])
+                  Path(temporary, 'payload').write_bytes(payload)
+                  result = subprocess.run(['openssl', 'dgst', '-sha256', '-verify', str(key_file), '-signature',
+                                           f'{temporary}/signature', f'{temporary}/payload'], capture_output=True, text=True)
+              require(result.returncode == 0 and result.stdout.strip() == 'Verified OK', f'signature by {key_name} does not verify')
+
+
+          def package_file(path):
+              raw = path.read_bytes()
+              parts = streams(raw)
+              require(len(parts) == 3, 'APK must contain signature, control and data streams')
+              control, info = pkginfo(parts[1])
+              require('.melange.yaml' in control, 'APK lacks its embedded Melange configuration')
+              name, version = one(info, 'pkgname'), one(info, 'pkgver')
+              require(one(info, 'datahash') == sha256(parts[2]), 'APK data differs from its datahash')
+              sbom = members(parts[2]).get(f'var/lib/db/sbom/{name}-{version}.spdx.json')
+              require(sbom is not None, 'APK lacks its Melange SBOM')
+              return dict(raw=raw, parts=parts, name=name, version=version, arch=one(info, 'arch'), lock=control['.melange.yaml'],
+                          builddate=int(one(info, 'builddate')), created=(json.loads(sbom).get('creationInfo') or {}).get('created'))
+
+
+          def confined(link, base, expected):
+              # Cache entries are relative symlinks; never follow one outside its own cache directory.
+              require(link.is_symlink() and not os.path.isabs(os.readlink(link)), 'cache entries must be relative symlinks')
+              resolved = Path(os.path.realpath(link))
+              require(resolved.is_relative_to(Path(os.path.realpath(base))), 'cache symlink leaves its cache directory')
+              require(resolved == Path(os.path.realpath(expected)) and resolved.is_file(), 'cache symlink does not point to its stream')
+              return resolved.read_bytes()
+
+
+          def package_record(directory, arch):
+              entries = {path.name: path for path in directory.iterdir()}
+              expanded = [path for path in entries.values() if path.is_dir() and not path.is_symlink()]
+              require(len(expanded) == 1 and re.fullmatch(r'expand-apk[0-9]+', expanded[0].name), 'unrecognized package cache layout')
+              found = {path.name: path for path in expanded[0].iterdir()}
+              require(sorted(found) == ['stream-0.tar.gz', 'stream-1.tar', 'stream-1.tar.gz']
+                      and all(path.is_file() and not path.is_symlink() for path in found.values()), 'unrecognized expanded package layout')
+              links = [name for name in entries if entries[name] != expanded[0]]
+              control_name = [name for name in links if re.fullmatch(r'[0-9a-f]{40}\.ctl\.tar\.gz', name)]
+              data_name = [name for name in links if re.fullmatch(r'[0-9a-f]{64}\.dat\.tar\.gz', name)]
+              plain_name = [name for name in links if re.fullmatch(r'[0-9a-f]{64}\.dat\.tar', name)]
+              require(len(links) == 3 and len(control_name) == len(data_name) == len(plain_name) == 1, 'unrecognized package cache entries')
+              control = confined(entries[control_name[0]], directory, found['stream-0.tar.gz'])
+              data = confined(entries[data_name[0]], directory, found['stream-1.tar.gz'])
+              plain = confined(entries[plain_name[0]], directory, found['stream-1.tar'])
+              require(hashlib.sha1(control).hexdigest() == control_name[0][:40] and sha256(data) == data_name[0][:64] == plain_name[0][:64],
+                      'cache entry names do not match their bytes')
+              require(gzip.decompress(data) == plain, 'expanded data differs from the cached data stream')
+              _, info = pkginfo(control)
+              name, version = one(info, 'pkgname'), one(info, 'pkgver')
+              require(f'{name}-{version}' == directory.name and one(info, 'arch') == arch, 'cached control stream belongs to another package')
+              require(one(info, 'datahash') == sha256(data), 'cached data stream differs from the control datahash')
+              # Only the control and data gzip streams are cached; the signature stream is not, so no full APK is recovered.
+              return dict(name=name, version=version, arch=arch, control_stream_sha256=sha256(control), control_stream_size=len(control),
+                          control_checksum=q1(control), datahash=one(info, 'datahash'), data_stream_sha256=sha256(data),
+                          data_stream_size=len(data))
+
+
+          def index_record(directory, keys):
+              entries = list(directory.iterdir())
+              files = [path for path in entries if path.is_file() and not path.is_symlink()]
+              links = [path for path in entries if path.is_symlink()]
+              require(len(entries) == 2 and len(files) == len(links) == 1 and re.fullmatch(r'[0-9]+\.tmp', files[0].name)
+                      and re.fullmatch(r'[A-Z2-7]+=*\.tar\.gz', links[0].name), 'unrecognized APKINDEX cache layout')
+              raw = confined(links[0], directory, files[0])
+              parts = streams(raw)
+              require(len(parts) == 2, 'APKINDEX must contain signature and index streams')
+              names = sorted(members(parts[0]))
+              require(len(names) == 1 and names[0].startswith('.SIGN.RSA256.') and names[0][13:] in keys,
+                      'resolution index is not signed by a declared keyring file')
+              key_file, key = keys[names[0][13:]]
+              verify(parts[0], parts[1], key_file, names[0][13:])
+              return dict(role='RESOLUTION_INDEX', cache_entry=links[0].name, sha256=sha256(raw), size=len(raw),
+                          signature_key=dict(path=key['path'], sha256=key['sha256']), signature_verified=True), apkindex(parts[1])
+
+
+          def cache_materials(root, repositories, keyring, locks):
+              """Read the go-apk cache layout observed with the pinned Melange (apko v1.4.6); reject anything else."""
+              keys = {}
+              for key in keyring:
+                  require(sha256(Path(key['path']).read_bytes()) == key['sha256'], 'declared keyring file changed')
+                  keys[Path(key['path']).name] = (Path(key['path']), key)
+              known = {urllib.parse.quote(repository, safe=''): repository for repository in repositories}
+              materials, indexes = {arch: {} for arch in locks}, {arch: {} for arch in locks}
+              for repository_dir in sorted(Path(root).iterdir()):
+                  require(repository_dir.name in known and repository_dir.is_dir() and not repository_dir.is_symlink(),
+                          'unrecognized entry in the Melange cache')
+                  repository = known[repository_dir.name]
+                  for arch_dir in sorted(repository_dir.iterdir()):
+                      require(arch_dir.name in locks and arch_dir.is_dir() and not arch_dir.is_symlink(),
+                              'unrecognized architecture in the Melange cache')
+                      arch, index = arch_dir.name, None
+                      for entry in sorted(arch_dir.iterdir()):
+                          require(entry.is_dir() and not entry.is_symlink(), 'unrecognized file in the Melange cache')
+                          if entry.name == 'APKINDEX':
+                              indexes[arch][repository], index = index_record(entry, keys)
+                              continue
+                          record = dict(package_record(entry, arch), repository=repository)
+                          require((record['name'], record['version']) not in materials[arch], 'duplicate dependency material')
+                          materials[arch][(record['name'], record['version'])] = record
+                      require(index is not None, 'the resolution index is missing from the Melange cache')
+                      for (name, version), record in materials[arch].items():
+                          if record['repository'] == repository:
+                              matches = index.get((name, version, arch), [])
+                              require(len(matches) == 1 and matches[0].get('C') == record['control_checksum'],
+                                      'the resolution index does not describe the consumed control stream')
+                              record['resolution_index_sha256'] = indexes[arch][repository]['sha256']
+                              record['checks'] = dict(cache_names_recomputed=True, data_expansion_matches=True,
+                                                      datahash_matches_data=True, index_checksum_matches_control=True,
+                                                      index_signature_verified=True)
+              for arch, lock in locks.items():
+                  require(set(materials[arch]) == set(lock), f'dependency materials differ from the {arch} lock')
+              return ({arch: [materials[arch][key] for key in sorted(materials[arch])] for arch in sorted(locks)},
+                      {arch: [indexes[arch][repository] for repository in sorted(indexes[arch])] for arch in sorted(locks)})
+
+
+          def identity(record):
+              return {key: value for key, value in record.items() if key not in ('resolution_index_sha256', 'checks')}
+
+
+          def docker(*arguments):
+              return subprocess.run(['docker', *arguments], check=True, text=True, capture_output=True).stdout
+
+
+          def melange_image(requested, digest, platform):
+              """The pinned image as Docker resolved it; its Config.Env is the Melange process environment (no -e is passed)."""
+              inspected = json.loads(docker('image', 'inspect', requested))
+              require(isinstance(inspected, list) and len(inspected) == 1, 'expected one inspected Melange image')
+              image = inspected[0]
+              resolved = {reference.partition('@')[2] for reference in image.get('RepoDigests') or []
+                          if reference.partition('@')[0] == 'cgr.dev/chainguard/melange'}
+              require(resolved == {digest}, 'resolved Melange digest differs from the recorded digest')
+              require(image.get('Os', '') + '/' + image.get('Architecture', '') == platform, 'Melange host platform differs')
+              # Melange v0.61.2 lets SOURCE_DATE_EPOCH in its own process override --build-date (pkg/build/build.go).
+              names = [item.partition('=')[0] for item in (image.get('Config') or {}).get('Env') or []]
+              require('SOURCE_DATE_EPOCH' not in names, 'SOURCE_DATE_EPOCH reaches the Melange process')
+              return 'absent'
+          # --- end of HGC-03 shared helpers ---
+
+
+          environment_raw = Path('melange/melange-environment-evidence.json').read_bytes()
+          binfmt_raw = Path('melange/binfmt-evidence.json').read_bytes()
+          environment, binfmt = json.loads(environment_raw), json.loads(binfmt_raw)
+          facts = environment['environment']
+          require(sorted(facts['targets']) == sorted(TARGETS), 'HGC-02 targets differ from the reproducibility targets')
+          require(facts['tool']['requested_ref'] == os.environ['MELANGE_IMAGE'] and binfmt['requested_ref'] == os.environ['BINFMT_IMAGE'],
+                  'pinned tools differ from their receipts')
+          process_epoch = melange_image(os.environ['MELANGE_IMAGE'], facts['tool']['resolved_digest'], facts['host_platform'])
+          locks = {arch: {(item['name'], item['version']) for item in target['packages']} for arch, target in facts['targets'].items()}
+          dependencies, indexes = cache_materials(Path(os.environ['RUNNER_TEMP'], 'melange-apk-cache'), facts['repositories'],
+                                                  facts['keyring'], locks)
+          build_date, host_epoch = os.environ['BUILD_DATE'], int(os.environ['SOURCE_DATE_EPOCH'])
+          require(epoch(build_date) == host_epoch, 'BUILD_DATE and SOURCE_DATE_EPOCH describe different instants')
+          head = subprocess.run(['git', 'show', '-s', '--format=%H %cI', 'HEAD'], capture_output=True, text=True,
+                                check=True).stdout.split()
+          require(head == [environment['producer']['source_sha'], build_date], 'BUILD_DATE does not come from the built commit')
+          for arch in sorted(TARGETS):
+              for path in sorted(Path('melange/packages', arch).glob('*.apk')):
+                  package = package_file(path)
+                  require(package['builddate'] == host_epoch and package['created'] == build_date,
+                          'Melange did not apply the exact --build-date string')
+          temporal = dict(build_date=build_date, build_date_source='git show -s --format=%cI HEAD', build_date_commit=head[0],
+                          host_source_date_epoch=host_epoch, melange_process_source_date_epoch=process_epoch,
+                          applied='--build-date', observed_in_outputs=dict(pkginfo_builddate=host_epoch, sbom_created=build_date))
+          producer = dict(environment['producer'], job=os.environ['GITHUB_JOB'], runner=os.environ['RUNNER_NAME'])
+          document = dict(schema_version=1, kind='melange-reproduction-reference', producer=producer,
+                          receipts=dict(binfmt_evidence=sha256(binfmt_raw), melange_environment_evidence=sha256(environment_raw)),
+                          temporal=temporal, dependencies=dependencies, resolution_indexes=indexes)
+          output = Path(os.environ['RUNNER_TEMP'], 'melange-reproduction')
+          output.mkdir()
+          (output / 'melange-reproduction-reference.json').write_bytes(canonical(document))
+          PY
+
       - name: Upload melange repository
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -459,9 +742,592 @@ jobs:
             melange/melange-environment-evidence.json
           retention-days: 30
 
+      - name: Upload Melange reproduction reference
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: melange-reproduction-reference
+          overwrite: true
+          path: ${{ runner.temp }}/melange-reproduction/melange-reproduction-reference.json
+          retention-days: 30
+          if-no-files-found: error
+
+  # HGC-03: rebuilds the CA package on another runner of the same run with a
+  # new ephemeral key and the recorded BUILD_DATE string, then compares the
+  # original control and data streams and the dependency materials.
+  melange-reproduce:
+    name: Reproduce CA package with melange
+    needs: melange-bundle
+    runs-on: ubuntu-latest
+    # Same Melange build as melange-bundle (21-37 s observed, M14) plus the
+    # comparison; not yet observed on a hosted runner, hence the margin.
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Validate workflow inputs before privileged operations
+        env:
+          FRAMEWORKS: ${{ inputs.frameworks }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f scripts/pipeline/catalog/validate_inputs.py ]]; then
+            python3 -B -m scripts.pipeline.catalog.validate_inputs
+          else
+            python3 -B .github/scripts/validate_inputs.py
+          fi
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4
+        with:
+          platforms: arm64
+          image: ${{ env.BINFMT_IMAGE }}
+
+      # Reference outputs and receipts stay in RUNNER_TEMP: they never enter
+      # the rebuild workspace.
+      - name: Download reference melange repository
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: melange-repo
+          path: ${{ runner.temp }}/reproduction-reference/melange-repo
+
+      - name: Download Melange reproduction reference
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: melange-reproduction-reference
+          path: ${{ runner.temp }}/reproduction-reference/capture
+
+      - name: Prepare reproduction inputs
+        env:
+          MELANGE_CONFIG: ${{ inputs.melange-config }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+
+
+          def require(condition, message):
+              if not condition:
+                  raise ValueError(message)
+
+
+          def canonical(value):
+              return json.dumps(value, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()
+
+
+          reference = Path(os.environ['RUNNER_TEMP'], 'reproduction-reference')
+          environment_raw = (reference / 'melange-repo/melange-environment-evidence.json').read_bytes()
+          binfmt_raw = (reference / 'melange-repo/binfmt-evidence.json').read_bytes()
+          capture_raw = (reference / 'capture/melange-reproduction-reference.json').read_bytes()
+          environment, capture = json.loads(environment_raw), json.loads(capture_raw)
+          require(canonical(environment) == environment_raw and canonical(capture) == capture_raw, 'reference receipts are not canonical')
+          require(environment.get('kind') == 'melange-environment-evidence' and capture.get('kind') == 'melange-reproduction-reference'
+                  and capture.get('schema_version') == 1, 'unexpected reference receipt kind')
+          require(capture['receipts'] == dict(binfmt_evidence=hashlib.sha256(binfmt_raw).hexdigest(),
+                                              melange_environment_evidence=hashlib.sha256(environment_raw).hexdigest()),
+                  'the reference capture is bound to other receipts')
+          producer, attempt = environment['producer'], int(os.environ['GITHUB_RUN_ATTEMPT'])
+          require(producer['repository'] == os.environ['GITHUB_REPOSITORY'].lower() and producer['ref'] == os.environ['GITHUB_REF']
+                  and producer['source_sha'] == os.environ['GITHUB_SHA'] and producer['run_id'] == int(os.environ['GITHUB_RUN_ID'])
+                  and 0 < producer['run_attempt'] <= attempt, 'reference receipts belong to another run or commit')
+          require({key: value for key, value in capture['producer'].items() if key not in ('job', 'runner')} == producer,
+                  'the reference capture has another producer')
+          require(capture['producer']['job'] != os.environ['GITHUB_JOB'], 'the rebuild must run in another job')
+          files = {}
+          for path in sorted(Path('melange').rglob('*')):
+              require(not path.is_symlink(), 'symbolic links are not accepted in the Melange source directory')
+              if path.is_file():
+                  files['melange/' + path.relative_to('melange').as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
+              else:
+                  require(path.is_dir(), 'only regular files are accepted in the Melange source directory')
+          facts = environment['environment']
+          require(files == {item['path']: item['sha256'] for item in facts['source_files']},
+                  'the rebuild source directory differs from the reference sources')
+          require('melange/' + os.environ['MELANGE_CONFIG'] == facts['configuration']['path']
+                  and os.environ['MELANGE_IMAGE'] == facts['tool']['requested_ref'], 'the rebuild request differs from the reference')
+          temporal = capture['temporal']
+          head = subprocess.run(['git', 'show', '-s', '--format=%H %cI', 'HEAD'], capture_output=True, text=True,
+                                check=True).stdout.split()
+          require(head == [producer['source_sha'], temporal['build_date']], 'the recorded BUILD_DATE does not belong to this commit')
+          with open(os.environ['GITHUB_ENV'], 'a') as stream:
+              stream.write(f"BUILD_DATE={temporal['build_date']}\nSOURCE_DATE_EPOCH={temporal['host_source_date_epoch']}\n")
+          PY
+
+      - name: Generate ephemeral melange signing key
+        working-directory: melange
+        run: |
+          docker run --rm -v "$PWD":/work -w /work "$MELANGE_IMAGE" \
+            keygen melange.rsa
+
+      # HGC-03: same text in both jobs. The dependency cache of the pinned
+      # tool stays outside melange/, so it is neither a source file nor part
+      # of the HGC-02 environment; it starts empty in each job.
+      - name: Build CA package (amd64 + arm64)
+        env:
+          MELANGE_CONFIG: ${{ inputs.melange-config }}
+        working-directory: melange
+        run: |
+          set -eu
+          mkdir "$RUNNER_TEMP/melange-apk-cache"
+          # Cada processo usa uma arquitetura para evitar corrida no workspace
+          # compartilhado (test-dirfs-0 ausente observado no runner real).
+          for ARCH in x86_64 aarch64; do
+            docker run --privileged --rm -v "$PWD":/work -w /work \
+              -v "$RUNNER_TEMP/melange-apk-cache":/apk-cache "$MELANGE_IMAGE" \
+              build "$MELANGE_CONFIG" --arch "$ARCH" --signing-key melange.rsa --build-date "$BUILD_DATE" \
+              --apk-cache-dir /apk-cache
+          done
+
+      # HGC-03: Melange runs as root and leaves root-only cache directories;
+      # -h changes the cache symlinks themselves and never follows them.
+      - name: Hand the Melange cache to the runner user
+        run: sudo chown -hR "$(id -u):$(id -g)" "$RUNNER_TEMP/melange-apk-cache"
+
+      - name: Record Melange reproducibility evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B - <<'PY'
+          import base64
+          import datetime
+          import gzip
+          import hashlib
+          import io
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import tarfile
+          import tempfile
+          import urllib.parse
+          import zlib
+
+          # --- HGC-03 shared helpers: byte-identical in both jobs (tests enforce it) ---
+          TARGETS = {'aarch64': 'arm64', 'x86_64': 'amd64'}
+
+
+          def require(condition, message):
+              if not condition:
+                  raise ValueError(message)
+
+
+          def canonical(value):
+              return json.dumps(value, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()
+
+
+          def sha256(data):
+              return hashlib.sha256(data).hexdigest()
+
+
+          def q1(control):
+              return 'Q1' + base64.b64encode(hashlib.sha1(control).digest()).decode()
+
+
+          def epoch(value):
+              require(re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:\d{2})', value),
+                      'BUILD_DATE must be an RFC3339 second-precision timestamp')
+              return int(datetime.datetime.fromisoformat(value.replace('Z', '+00:00')).timestamp())
+
+
+          def streams(raw):
+              parts, offset = [], 0
+              while offset < len(raw):
+                  stream = zlib.decompressobj(31)
+                  stream.decompress(raw[offset:])
+                  require(stream.eof, 'truncated gzip stream')
+                  used = len(raw) - offset - len(stream.unused_data)
+                  parts.append(raw[offset:offset + used])
+                  offset += used
+              return parts
+
+
+          def members(stream):
+              with tarfile.open(fileobj=io.BytesIO(gzip.decompress(stream))) as archive:
+                  return {entry.name: archive.extractfile(entry).read() for entry in archive.getmembers() if entry.isfile()}
+
+
+          def pkginfo(control):
+              entries = members(control)
+              require('.PKGINFO' in entries, 'control stream lacks .PKGINFO')
+              info = {}
+              for line in entries['.PKGINFO'].decode().splitlines():
+                  if line and not line.startswith('#'):
+                      key, found, value = line.partition(' = ')
+                      require(found, 'malformed .PKGINFO')
+                      info.setdefault(key, []).append(value)
+              return entries, info
+
+
+          def one(values, key):
+              require(len(values.get(key, [])) == 1, f'package metadata must contain exactly one {key}')
+              return values[key][0]
+
+
+          def apkindex(stream):
+              index = {}
+              for block in members(stream).get('APKINDEX', b'').decode().strip().split('\n\n'):
+                  entry = {}
+                  for line in block.splitlines():
+                      key, found, value = line.partition(':')
+                      require(found and len(key) == 1 and key not in entry, 'malformed APKINDEX entry')
+                      entry[key] = value
+                  index.setdefault((entry.get('P'), entry.get('V'), entry.get('A')), []).append(entry)
+              return index
+
+
+          def verify(signature_stream, payload, key_file, key_name):
+              entries = members(signature_stream)
+              require(sorted(entries) == ['.SIGN.RSA256.' + key_name], f'expected one signature by {key_name}')
+              with tempfile.TemporaryDirectory() as temporary:
+                  Path(temporary, 'signature').write_bytes(entries['.SIGN.RSA256.' + key_name])
+                  Path(temporary, 'payload').write_bytes(payload)
+                  result = subprocess.run(['openssl', 'dgst', '-sha256', '-verify', str(key_file), '-signature',
+                                           f'{temporary}/signature', f'{temporary}/payload'], capture_output=True, text=True)
+              require(result.returncode == 0 and result.stdout.strip() == 'Verified OK', f'signature by {key_name} does not verify')
+
+
+          def package_file(path):
+              raw = path.read_bytes()
+              parts = streams(raw)
+              require(len(parts) == 3, 'APK must contain signature, control and data streams')
+              control, info = pkginfo(parts[1])
+              require('.melange.yaml' in control, 'APK lacks its embedded Melange configuration')
+              name, version = one(info, 'pkgname'), one(info, 'pkgver')
+              require(one(info, 'datahash') == sha256(parts[2]), 'APK data differs from its datahash')
+              sbom = members(parts[2]).get(f'var/lib/db/sbom/{name}-{version}.spdx.json')
+              require(sbom is not None, 'APK lacks its Melange SBOM')
+              return dict(raw=raw, parts=parts, name=name, version=version, arch=one(info, 'arch'), lock=control['.melange.yaml'],
+                          builddate=int(one(info, 'builddate')), created=(json.loads(sbom).get('creationInfo') or {}).get('created'))
+
+
+          def confined(link, base, expected):
+              # Cache entries are relative symlinks; never follow one outside its own cache directory.
+              require(link.is_symlink() and not os.path.isabs(os.readlink(link)), 'cache entries must be relative symlinks')
+              resolved = Path(os.path.realpath(link))
+              require(resolved.is_relative_to(Path(os.path.realpath(base))), 'cache symlink leaves its cache directory')
+              require(resolved == Path(os.path.realpath(expected)) and resolved.is_file(), 'cache symlink does not point to its stream')
+              return resolved.read_bytes()
+
+
+          def package_record(directory, arch):
+              entries = {path.name: path for path in directory.iterdir()}
+              expanded = [path for path in entries.values() if path.is_dir() and not path.is_symlink()]
+              require(len(expanded) == 1 and re.fullmatch(r'expand-apk[0-9]+', expanded[0].name), 'unrecognized package cache layout')
+              found = {path.name: path for path in expanded[0].iterdir()}
+              require(sorted(found) == ['stream-0.tar.gz', 'stream-1.tar', 'stream-1.tar.gz']
+                      and all(path.is_file() and not path.is_symlink() for path in found.values()), 'unrecognized expanded package layout')
+              links = [name for name in entries if entries[name] != expanded[0]]
+              control_name = [name for name in links if re.fullmatch(r'[0-9a-f]{40}\.ctl\.tar\.gz', name)]
+              data_name = [name for name in links if re.fullmatch(r'[0-9a-f]{64}\.dat\.tar\.gz', name)]
+              plain_name = [name for name in links if re.fullmatch(r'[0-9a-f]{64}\.dat\.tar', name)]
+              require(len(links) == 3 and len(control_name) == len(data_name) == len(plain_name) == 1, 'unrecognized package cache entries')
+              control = confined(entries[control_name[0]], directory, found['stream-0.tar.gz'])
+              data = confined(entries[data_name[0]], directory, found['stream-1.tar.gz'])
+              plain = confined(entries[plain_name[0]], directory, found['stream-1.tar'])
+              require(hashlib.sha1(control).hexdigest() == control_name[0][:40] and sha256(data) == data_name[0][:64] == plain_name[0][:64],
+                      'cache entry names do not match their bytes')
+              require(gzip.decompress(data) == plain, 'expanded data differs from the cached data stream')
+              _, info = pkginfo(control)
+              name, version = one(info, 'pkgname'), one(info, 'pkgver')
+              require(f'{name}-{version}' == directory.name and one(info, 'arch') == arch, 'cached control stream belongs to another package')
+              require(one(info, 'datahash') == sha256(data), 'cached data stream differs from the control datahash')
+              # Only the control and data gzip streams are cached; the signature stream is not, so no full APK is recovered.
+              return dict(name=name, version=version, arch=arch, control_stream_sha256=sha256(control), control_stream_size=len(control),
+                          control_checksum=q1(control), datahash=one(info, 'datahash'), data_stream_sha256=sha256(data),
+                          data_stream_size=len(data))
+
+
+          def index_record(directory, keys):
+              entries = list(directory.iterdir())
+              files = [path for path in entries if path.is_file() and not path.is_symlink()]
+              links = [path for path in entries if path.is_symlink()]
+              require(len(entries) == 2 and len(files) == len(links) == 1 and re.fullmatch(r'[0-9]+\.tmp', files[0].name)
+                      and re.fullmatch(r'[A-Z2-7]+=*\.tar\.gz', links[0].name), 'unrecognized APKINDEX cache layout')
+              raw = confined(links[0], directory, files[0])
+              parts = streams(raw)
+              require(len(parts) == 2, 'APKINDEX must contain signature and index streams')
+              names = sorted(members(parts[0]))
+              require(len(names) == 1 and names[0].startswith('.SIGN.RSA256.') and names[0][13:] in keys,
+                      'resolution index is not signed by a declared keyring file')
+              key_file, key = keys[names[0][13:]]
+              verify(parts[0], parts[1], key_file, names[0][13:])
+              return dict(role='RESOLUTION_INDEX', cache_entry=links[0].name, sha256=sha256(raw), size=len(raw),
+                          signature_key=dict(path=key['path'], sha256=key['sha256']), signature_verified=True), apkindex(parts[1])
+
+
+          def cache_materials(root, repositories, keyring, locks):
+              """Read the go-apk cache layout observed with the pinned Melange (apko v1.4.6); reject anything else."""
+              keys = {}
+              for key in keyring:
+                  require(sha256(Path(key['path']).read_bytes()) == key['sha256'], 'declared keyring file changed')
+                  keys[Path(key['path']).name] = (Path(key['path']), key)
+              known = {urllib.parse.quote(repository, safe=''): repository for repository in repositories}
+              materials, indexes = {arch: {} for arch in locks}, {arch: {} for arch in locks}
+              for repository_dir in sorted(Path(root).iterdir()):
+                  require(repository_dir.name in known and repository_dir.is_dir() and not repository_dir.is_symlink(),
+                          'unrecognized entry in the Melange cache')
+                  repository = known[repository_dir.name]
+                  for arch_dir in sorted(repository_dir.iterdir()):
+                      require(arch_dir.name in locks and arch_dir.is_dir() and not arch_dir.is_symlink(),
+                              'unrecognized architecture in the Melange cache')
+                      arch, index = arch_dir.name, None
+                      for entry in sorted(arch_dir.iterdir()):
+                          require(entry.is_dir() and not entry.is_symlink(), 'unrecognized file in the Melange cache')
+                          if entry.name == 'APKINDEX':
+                              indexes[arch][repository], index = index_record(entry, keys)
+                              continue
+                          record = dict(package_record(entry, arch), repository=repository)
+                          require((record['name'], record['version']) not in materials[arch], 'duplicate dependency material')
+                          materials[arch][(record['name'], record['version'])] = record
+                      require(index is not None, 'the resolution index is missing from the Melange cache')
+                      for (name, version), record in materials[arch].items():
+                          if record['repository'] == repository:
+                              matches = index.get((name, version, arch), [])
+                              require(len(matches) == 1 and matches[0].get('C') == record['control_checksum'],
+                                      'the resolution index does not describe the consumed control stream')
+                              record['resolution_index_sha256'] = indexes[arch][repository]['sha256']
+                              record['checks'] = dict(cache_names_recomputed=True, data_expansion_matches=True,
+                                                      datahash_matches_data=True, index_checksum_matches_control=True,
+                                                      index_signature_verified=True)
+              for arch, lock in locks.items():
+                  require(set(materials[arch]) == set(lock), f'dependency materials differ from the {arch} lock')
+              return ({arch: [materials[arch][key] for key in sorted(materials[arch])] for arch in sorted(locks)},
+                      {arch: [indexes[arch][repository] for repository in sorted(indexes[arch])] for arch in sorted(locks)})
+
+
+          def identity(record):
+              return {key: value for key, value in record.items() if key not in ('resolution_index_sha256', 'checks')}
+
+
+          def docker(*arguments):
+              return subprocess.run(['docker', *arguments], check=True, text=True, capture_output=True).stdout
+
+
+          def melange_image(requested, digest, platform):
+              """The pinned image as Docker resolved it; its Config.Env is the Melange process environment (no -e is passed)."""
+              inspected = json.loads(docker('image', 'inspect', requested))
+              require(isinstance(inspected, list) and len(inspected) == 1, 'expected one inspected Melange image')
+              image = inspected[0]
+              resolved = {reference.partition('@')[2] for reference in image.get('RepoDigests') or []
+                          if reference.partition('@')[0] == 'cgr.dev/chainguard/melange'}
+              require(resolved == {digest}, 'resolved Melange digest differs from the recorded digest')
+              require(image.get('Os', '') + '/' + image.get('Architecture', '') == platform, 'Melange host platform differs')
+              # Melange v0.61.2 lets SOURCE_DATE_EPOCH in its own process override --build-date (pkg/build/build.go).
+              names = [item.partition('=')[0] for item in (image.get('Config') or {}).get('Env') or []]
+              require('SOURCE_DATE_EPOCH' not in names, 'SOURCE_DATE_EPOCH reaches the Melange process')
+              return 'absent'
+          # --- end of HGC-03 shared helpers ---
+
+
+          QUERY = ('{{range .Environment.Contents.Packages}}package\t{{.}}\n{{end}}'
+                   '{{range .Environment.Contents.Repositories}}repository\t{{.}}\n{{end}}'
+                   '{{range .Environment.Contents.Keyring}}keyring\t{{.}}\n{{end}}'
+                   '{{range .Environment.Archs}}arch\t{{.}}\n{{end}}'
+                   'name\t{{.Package.Name}}\nversion\t{{.Package.Version}}\nepoch\t{{.Package.Epoch}}\n')
+          VERSION = dict(gitVersion='git_version', gitCommit='git_commit', gitTreeState='git_tree_state', buildDate='build_date',
+                         goVersion='go_version', compiler='compiler', platform='platform')
+          LIMITS = [
+              'Scope: the configured Melange CA package for aarch64 and x86_64; not Melange or the catalog in general.',
+              'Equality covers the original control and data stream bytes; signature streams, APKINDEX and full signed APKs are '
+              'excluded and verified per build against each ephemeral public key.',
+              'Independence is CROSS_JOB_SAME_RUN: another job and runner of the same run, not CROSS_RUN and not an '
+              'independent review.',
+              'Dependency identity covers the control and data streams consumed by these two builds; the signature stream is '
+              'not cached, so no complete dependency APK is recovered.',
+              'Each index is the RESOLUTION_INDEX the pinned tool cached and served to its resolver; no separate '
+              'VERIFICATION_INDEX snapshot is consulted.',
+              'Keys that apko may discover in a repository are not observable (P1-03); indexes are accepted only when a '
+              'declared keyring file verifies them.',
+              'Observed payloads fit one pgzip block; determinism of multi-block payloads is not claimed.',
+              'Recorded hashes do not guarantee future availability of the packages, offline replay or a mirror.',
+              'The evidence lives in workflow artifacts; durable custody belongs to HGC-04.',
+          ]
+          reference_root = Path(os.environ['RUNNER_TEMP'], 'reproduction-reference')
+          environment_raw = (reference_root / 'melange-repo/melange-environment-evidence.json').read_bytes()
+          binfmt_raw = (reference_root / 'melange-repo/binfmt-evidence.json').read_bytes()
+          capture_raw = (reference_root / 'capture/melange-reproduction-reference.json').read_bytes()
+          environment, binfmt, capture = json.loads(environment_raw), json.loads(binfmt_raw), json.loads(capture_raw)
+          require(canonical(capture) == capture_raw and canonical(environment) == environment_raw
+                  and capture['receipts'] == dict(binfmt_evidence=sha256(binfmt_raw), melange_environment_evidence=sha256(environment_raw)),
+                  'reference receipts changed after their capture')
+          facts, temporal = environment['environment'], capture['temporal']
+          image, build_date = facts['tool']['requested_ref'], temporal['build_date']
+          require(os.environ['MELANGE_IMAGE'] == image and os.environ['BUILD_DATE'] == build_date,
+                  'the rebuild did not use the recorded tool and BUILD_DATE')
+          process_epoch = melange_image(image, facts['tool']['resolved_digest'], facts['host_platform'])
+          version = json.loads(docker('run', '--rm', image, 'version', '--json'))
+          require(isinstance(version, dict) and set(version) == set(VERSION)
+                  and {VERSION[key]: value for key, value in version.items()} == facts['tool']['version'], 'the rebuild Melange differs')
+          require(os.environ['BINFMT_IMAGE'] == binfmt['requested_ref'], 'the rebuild binfmt pin differs')
+          binfmt_digests = {reference.partition('@')[2] for item in json.loads(docker('image', 'inspect', binfmt['requested_ref']))
+                            for reference in item.get('RepoDigests') or []
+                            if reference.partition('@')[0] in ('docker.io/tonistiigi/binfmt', 'tonistiigi/binfmt')}
+          require(binfmt_digests == {binfmt['resolved_digest']}, 'the rebuild binfmt digest differs')
+
+
+          def query(path):
+              output = docker('run', '--rm', '-v', f'{path.parent.resolve()}:/query:ro', '-w', '/query', image, 'query', path.name, QUERY)
+              result = dict(package=[], repository=[], keyring=[], arch=[], name=[], version=[], epoch=[])
+              for line in output.splitlines():
+                  key, separator, value = line.partition('\t')
+                  require(separator and key in result and value and value == value.strip(), 'unexpected Melange query output')
+                  result[key].append(value)
+              packages = set()
+              for item in result['package']:
+                  match = re.fullmatch(r'([A-Za-z0-9][A-Za-z0-9+._-]*)=([0-9A-Za-z][0-9A-Za-z+._~-]*-r[0-9]+)', item)
+                  require(match and (match[1], match[2]) not in packages, 'rebuild environment package is not locked exactly once')
+                  packages.add((match[1], match[2]))
+              require(result['repository'] == facts['repositories']
+                      and ['melange/' + item for item in result['keyring']] == [key['path'] for key in facts['keyring']],
+                      'rebuild lock repositories or keyring differ from the reference environment')
+              return result['arch'], packages
+
+
+          def outputs_of(root, key_file):
+              """Each build is checked against its own public key; APKINDEX must describe exactly that build."""
+              outputs, signatures, packages = {}, dict(packages={}, apkindex={}), {}
+              require(sorted(path.name for path in root.iterdir()) == sorted(TARGETS), 'outputs must cover exactly the reproducibility targets')
+              for arch in sorted(TARGETS):
+                  directory = root / arch
+                  names = sorted(path.name for path in directory.iterdir())
+                  apks = [name for name in names if name.endswith('.apk')]
+                  require(apks and names == sorted(apks + ['APKINDEX.tar.gz']), f'unexpected Melange outputs for {arch}')
+                  index_raw = (directory / 'APKINDEX.tar.gz').read_bytes()
+                  index_parts = streams(index_raw)
+                  require(len(index_parts) == 2, 'APKINDEX must contain signature and index streams')
+                  verify(index_parts[0], index_parts[1], key_file, 'melange.rsa.pub')
+                  index, records, signed = apkindex(index_parts[1]), [], []
+                  for name in apks:
+                      package = package_file(directory / name)
+                      require(package['arch'] == arch and name == f"{package['name']}-{package['version']}.apk",
+                              'APK metadata differs from its output location')
+                      verify(package['parts'][0], package['parts'][1], key_file, 'melange.rsa.pub')
+                      entry = index.pop((package['name'], package['version'], arch), [])
+                      require(len(entry) == 1 and entry[0].get('C') == q1(package['parts'][1]) and entry[0].get('S') == str(len(package['raw'])),
+                              'APKINDEX does not describe the APK of its own build')
+                      packages[(arch, name)] = package
+                      records.append(dict(file=name, apk_sha256=sha256(package['raw']), apk_size=len(package['raw']),
+                                          control_stream_sha256=sha256(package['parts'][1]), control_checksum=q1(package['parts'][1]),
+                                          data_stream_sha256=sha256(package['parts'][2]), datahash=sha256(package['parts'][2])))
+                      signed.append(dict(file=name, signature_stream_sha256=sha256(package['parts'][0]),
+                                         signature='.SIGN.RSA256.melange.rsa.pub', verified=True))
+                  require(not index, 'APKINDEX lists packages that were not produced')
+                  outputs[arch] = records
+                  signatures['packages'][arch] = signed
+                  signatures['apkindex'][arch] = dict(sha256=sha256(index_raw), signature='.SIGN.RSA256.melange.rsa.pub', verified=True,
+                                                      describes_outputs=True)
+              return outputs, dict(signatures, public_key_sha256=sha256(key_file.read_bytes())), packages
+
+
+          reference_key, rebuild_key = reference_root / 'melange-repo/melange.rsa.pub', Path('melange/melange.rsa.pub')
+          require(sha256(reference_key.read_bytes()) == environment['signing_key']['sha256'], 'reference signing key differs from HGC-02')
+          require(sha256(rebuild_key.read_bytes()) != environment['signing_key']['sha256'], 'the rebuild must use its own ephemeral key')
+          reference_outputs, reference_signatures, reference_packages = outputs_of(reference_root / 'melange-repo/packages', reference_key)
+          require({arch: sorted(record['apk_sha256'] for record in records) for arch, records in reference_outputs.items()}
+                  == {arch: sorted(record['sha256'] for record in records) for arch, records in environment['outputs'].items()},
+                  'downloaded reference APKs differ from the HGC-02 outputs')
+          rebuild_outputs, rebuild_signatures, rebuild_packages = outputs_of(Path('melange/packages'), rebuild_key)
+          for package in rebuild_packages.values():
+              require(package['builddate'] == epoch(build_date) and package['created'] == build_date,
+                      'the rebuild did not apply the recorded --build-date string')
+          locks = {}
+          with tempfile.TemporaryDirectory() as temporary:
+              for (arch, name), package in sorted(rebuild_packages.items()):
+                  path = Path(temporary, f'{arch}-{name}', '.melange.yaml')
+                  path.parent.mkdir()
+                  path.write_bytes(package['lock'])
+                  archs, lock = query(path)
+                  require(archs == [TARGETS[arch]] and locks.setdefault(arch, lock) == lock, f'rebuild lock for {arch} is inconsistent')
+          dependencies, indexes = cache_materials(Path(os.environ['RUNNER_TEMP'], 'melange-apk-cache'), facts['repositories'],
+                                                  facts['keyring'], locks)
+          results, inputs_equal, outputs_equal = {}, True, True
+          for arch in sorted(TARGETS):
+              equal_inputs = [identity(item) for item in capture['dependencies'][arch]] == [identity(item) for item in dependencies[arch]]
+              names = sorted(name for target, name in reference_packages if target == arch)
+              require(names == sorted(name for target, name in rebuild_packages if target == arch), f'rebuild produced other {arch} APKs')
+              compared = []
+              for name in names:
+                  before, after = reference_packages[(arch, name)]['parts'], rebuild_packages[(arch, name)]['parts']
+                  compared.append(dict(file=name, control_stream_equal=before[1] == after[1], data_stream_equal=before[2] == after[2]))
+              inputs_equal &= equal_inputs
+              outputs_equal &= all(item['control_stream_equal'] and item['data_stream_equal'] for item in compared)
+              results[arch] = dict(dependencies_equal=equal_inputs, packages=compared)
+          runner, job, attempt = os.environ['RUNNER_NAME'], os.environ['GITHUB_JOB'], int(os.environ['GITHUB_RUN_ATTEMPT'])
+          reference_producer = capture['producer']
+          require(reference_producer['run_id'] == int(os.environ['GITHUB_RUN_ID']) and reference_producer['run_attempt'] <= attempt,
+                  'the reference belongs to another run')
+          independent = reference_producer['runner'] != runner and reference_producer['job'] != job
+          status = ('NOT_INDEPENDENT' if not independent else 'INPUTS_DIFFER' if not inputs_equal else
+                    'REPRODUCED' if outputs_equal else 'OUTPUTS_DIFFER_WITH_EQUAL_RECORDED_INPUTS')
+          rebuild_producer = dict({key: value for key, value in reference_producer.items() if key not in ('job', 'runner')},
+                                  run_attempt=attempt, release_id=f"r{reference_producer['run_id']}-a{attempt}", job=job, runner=runner)
+          inputs = dict(tool=facts['tool'], host_platform=facts['host_platform'],
+                        binfmt=dict(requested_ref=binfmt['requested_ref'], resolved_digest=binfmt['resolved_digest'],
+                                    qemu_version=binfmt['qemu_version']),
+                        configuration=dict(path=facts['configuration']['path'], sha256=facts['configuration']['sha256']),
+                        source_files=facts['source_files'], repositories=facts['repositories'], keyring=facts['keyring'],
+                        build=dict(build_date=build_date, parameter='--build-date', melange_process_source_date_epoch=temporal[
+                            'melange_process_source_date_epoch']),
+                        targets={arch: dict(environment_arch=TARGETS[arch], dependencies=[identity(item) for item in capture['dependencies'][arch]])
+                                 for arch in sorted(TARGETS)})
+          document = dict(
+              schema_version=1, kind='melange-reproducibility-evidence', status=status, independence='CROSS_JOB_SAME_RUN',
+              scope=dict(configuration=facts['configuration']['path'], targets=sorted(TARGETS),
+                         compared=['control_stream', 'data_stream'], excluded_from_equality=['signature_stream', 'apkindex', 'signed_apk']),
+              receipts=dict(binfmt_evidence=sha256(binfmt_raw), melange_environment_evidence=sha256(environment_raw),
+                            environment_digest=environment['environment_digest'], reproduction_reference=sha256(capture_raw)),
+              reference=dict(producer=reference_producer, temporal=temporal, resolution_indexes=capture['resolution_indexes'],
+                             dependencies=capture['dependencies'], outputs=reference_outputs),
+              rebuild=dict(producer=rebuild_producer, tool=dict(resolved_digest=facts['tool']['resolved_digest'], version=facts['tool']['version']),
+                           binfmt_resolved_digest=binfmt['resolved_digest'],
+                           temporal=dict(build_date=build_date, build_date_source='melange-reproduction-reference',
+                                         melange_process_source_date_epoch=process_epoch, applied='--build-date',
+                                         observed_in_outputs=dict(pkginfo_builddate=epoch(build_date), sbom_created=build_date)),
+                           resolution_indexes=indexes, dependencies=dependencies, outputs=rebuild_outputs),
+              reproduction_inputs=inputs, reproduction_input_digest='sha256:' + sha256(canonical(inputs)),
+              results=results, signatures=dict(reference=reference_signatures, rebuild=rebuild_signatures), limits=LIMITS)
+          if status != 'REPRODUCED':
+              diagnostics = Path(os.environ['RUNNER_TEMP'], 'melange-reproducibility-diagnostics')
+              diagnostics.mkdir()
+              (diagnostics / 'melange-reproducibility-diagnostics.json').write_bytes(
+                  canonical(dict(document, kind='melange-reproducibility-diagnostics')))
+              raise SystemExit(f'Melange CA package was not reproduced: {status} ' + json.dumps(results, sort_keys=True))
+          output = Path(os.environ['RUNNER_TEMP'], 'melange-reproducibility')
+          output.mkdir()
+          (output / 'melange-reproducibility-evidence.json').write_bytes(canonical(document))
+          PY
+
+      - name: Upload Melange reproducibility evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: melange-reproducibility
+          overwrite: true
+          path: ${{ runner.temp }}/melange-reproducibility/melange-reproducibility-evidence.json
+          retention-days: 30
+          if-no-files-found: error
+
+      # Diagnostics never carry the validated status and never feed validate.
+      - name: Preserve reproducibility diagnostics
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: melange-reproducibility-diagnostics-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/melange-reproducibility-diagnostics/
+          retention-days: 30
+          if-no-files-found: ignore
+
   validate:
     name: Validate ${{ matrix.framework }}
-    needs: melange-bundle
+    # HGC-03: candidates exist only after the reproduction job succeeded.
+    needs: [melange-bundle, melange-reproduce]
     runs-on: ubuntu-latest
     # Observado: 21-64s por framework num run real com 16 frameworks (M14).
     # dotnet8/java21 (SDK/JDK completos) foram os mais lentos observados;
@@ -497,6 +1363,75 @@ jobs:
           name: melange-repo
           path: melange-repo
 
+      - name: Download Melange reproducibility evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: melange-reproducibility
+          path: melange-reproducibility
+
+      - name: Require reproduced Melange package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+
+          def require(condition, message):
+              if not condition:
+                  raise ValueError(message)
+
+
+          def canonical(value):
+              return json.dumps(value, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()
+
+
+          def sha256(path):
+              return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+          raw = Path('melange-reproducibility/melange-reproducibility-evidence.json').read_bytes()
+          evidence = json.loads(raw)
+          require(canonical(evidence) == raw, 'reproducibility evidence is not canonical')
+          require(evidence.get('schema_version') == 1 and evidence.get('kind') == 'melange-reproducibility-evidence'
+                  and evidence.get('status') == 'REPRODUCED' and evidence.get('independence') == 'CROSS_JOB_SAME_RUN',
+                  'the Melange CA package was not reproduced')
+          receipts = evidence['receipts']
+          require(receipts['binfmt_evidence'] == sha256('melange-repo/binfmt-evidence.json')
+                  and receipts['melange_environment_evidence'] == sha256('melange-repo/melange-environment-evidence.json')
+                  and receipts['environment_digest'] == json.loads(
+                      Path('melange-repo/melange-environment-evidence.json').read_bytes())['environment_digest'],
+                  'reproducibility evidence is bound to other receipts')
+          run, attempt = int(os.environ['GITHUB_RUN_ID']), int(os.environ['GITHUB_RUN_ATTEMPT'])
+          reference, rebuild = evidence['reference']['producer'], evidence['rebuild']['producer']
+          for producer in (reference, rebuild):
+              require(producer['run_id'] == run and 0 < producer['run_attempt'] <= attempt
+                      and producer['repository'] == os.environ['GITHUB_REPOSITORY'].lower()
+                      and producer['source_sha'] == os.environ['GITHUB_SHA'] and producer['ref'] == os.environ['GITHUB_REF'],
+                      'reproducibility evidence belongs to another run')
+          require(reference['runner'] != rebuild['runner'] and reference['job'] != rebuild['job'], 'the rebuild was not independent')
+          require(evidence['reproduction_input_digest'] == 'sha256:' + hashlib.sha256(canonical(evidence['reproduction_inputs'])).hexdigest(),
+                  'reproduction input digest mismatch')
+          targets = sorted(evidence['scope']['targets'])
+          require(sorted(path.name for path in Path('melange-repo/packages').iterdir()) == targets
+                  and {arch: sorted((path.name, sha256(path)) for path in Path('melange-repo/packages', arch).glob('*.apk')) for arch in targets}
+                  == {arch: sorted((item['file'], item['apk_sha256']) for item in evidence['reference']['outputs'][arch]) for arch in targets},
+                  'candidate packages differ from the reproduced reference')
+          signatures = evidence['signatures']
+          require(signatures['reference']['public_key_sha256'] == sha256('melange-repo/melange.rsa.pub')
+                  and signatures['rebuild']['public_key_sha256'] != signatures['reference']['public_key_sha256']
+                  and all(item['verified'] for side in signatures.values() for arch in targets for item in side['packages'][arch])
+                  and all(side['apkindex'][arch]['verified'] and side['apkindex'][arch]['describes_outputs']
+                          for side in signatures.values() for arch in targets), 'output signatures were not verified')
+          require(sorted(evidence['results']) == targets
+                  and all(result['dependencies_equal'] and result['packages'] and all(
+                      item['control_stream_equal'] and item['data_stream_equal'] for item in result['packages'])
+                      for result in evidence['results'].values()), 'reproducibility results are not all equal')
+          PY
+
       - name: Set local image name
         env:
           FRAMEWORK: ${{ matrix.framework }}
@@ -521,6 +1456,8 @@ jobs:
           # Keep the original receipt with each candidate; HGC-04 will persist it durably.
           cp melange-repo/binfmt-evidence.json "${FRAMEWORK}.oci/binfmt-evidence.json"
           cp melange-repo/melange-environment-evidence.json "${FRAMEWORK}.oci/melange-environment-evidence.json"
+          cp melange-reproducibility/melange-reproducibility-evidence.json \
+            "${FRAMEWORK}.oci/melange-reproducibility-evidence.json"
 
       - name: Preserve SBOMs and replay inputs
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -533,6 +1470,7 @@ jobs:
             ${{ matrix.framework }}.oci/validated-index.json
             ${{ matrix.framework }}.oci/binfmt-evidence.json
             ${{ matrix.framework }}.oci/melange-environment-evidence.json
+            ${{ matrix.framework }}.oci/melange-reproducibility-evidence.json
           retention-days: 30
           if-no-files-found: error
 

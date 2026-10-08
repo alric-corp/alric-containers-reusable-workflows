@@ -1,0 +1,9 @@
+{
+  "name": "wolfi-signing-key",
+  "expected_sha256": "f0031424cf46f7db780ce63a45f0fd6aa6f85f601e6bb3b7a91fe3d4d5b7d2cc",
+  "sources": {
+    "distribution": "https://packages.wolfi.dev/os/wolfi-signing.rsa.pub",
+    "independent": "https://raw.githubusercontent.com/wolfi-dev/os/1d350667a46522847140ce4772bf306193b2f41a/wolfi-signing.rsa.pub"
+  },
+  "rotation": "docs/wolfi-signing-key.md"
+}
