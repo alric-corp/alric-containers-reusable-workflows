@@ -1,0 +1,15 @@
+package	busybox=1.38.0-r2
+package	ca-certificates-bundle=20260909-r2
+package	glibc-2.44-locale-posix=2.44-r8
+package	glibc-2.44=2.44-r8
+package	ld-linux-2.44=2.44-r8
+package	libcrypt1-2.44=2.44-r8
+package	libgcc=16.2.0-r1
+package	libxcrypt=4.5.2-r5
+package	wolfi-baselayout=20230201-r30
+repository	https://packages.wolfi.dev/os
+keyring	keys/wolfi-signing.rsa.pub
+arch	amd64
+name	image-base-ca-certificates
+version	1.0.0
+epoch	0

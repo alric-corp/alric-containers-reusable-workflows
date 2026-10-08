@@ -146,6 +146,84 @@ jobs:
           docker run --rm -v "$PWD":/work -w /work "$MELANGE_IMAGE" \
             keygen melange.rsa
 
+      # HGC-02: verify the tool and freeze the source directory before it is
+      # copied into the build workspace. The capture stays in RUNNER_TEMP.
+      - name: Capture Melange environment inputs
+        env:
+          MELANGE_CONFIG: ${{ inputs.melange-config }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+
+          GENERATED = {'binfmt-evidence.json', 'melange-version.txt', 'melange.rsa', 'melange.rsa.pub'}
+
+          def require(condition, message):
+              if not condition:
+                  raise ValueError(message)
+
+          def docker(*arguments):
+              return subprocess.run(['docker', *arguments], check=True, text=True, capture_output=True).stdout
+
+          def snapshot(root):
+              files, generated = {}, []
+              for path in sorted(root.rglob('*')):
+                  relative = path.relative_to(root).as_posix()
+                  if relative.split('/')[0] == 'packages':
+                      continue
+                  require(not path.is_symlink(), 'symbolic links are not accepted in the Melange source directory')
+                  if path.is_dir():
+                      continue
+                  require(path.is_file(), 'only regular files are accepted in the Melange source directory')
+                  if relative in GENERATED:
+                      generated.append(relative)
+                  else:
+                      files['melange/' + relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+              return files, generated
+
+          requested = os.environ['MELANGE_IMAGE']
+          pin = re.fullmatch(r'cgr\.dev/chainguard/melange(?::(?P<tag>[A-Za-z0-9_.-]+))?'
+                             r'@(?P<digest>sha256:[0-9a-f]{64})', requested)
+          require(pin is not None and pin['tag'] != 'latest', 'Melange must have an explicit immutable digest')
+          inspected = json.loads(docker('image', 'inspect', requested))
+          require(isinstance(inspected, list) and len(inspected) == 1, 'expected one inspected Melange image')
+          image = inspected[0]
+          resolved = set()
+          for reference in image.get('RepoDigests') or []:
+              repository, separator, digest = reference.partition('@')
+              if repository == 'cgr.dev/chainguard/melange' and separator:
+                  resolved.add(digest)
+          require(resolved == {pin['digest']}, 'resolved Melange digest differs from the requested digest')
+          host = image.get('Os', '') + '/' + image.get('Architecture', '')
+          require(host == 'linux/amd64', 'the hosted Melange build must run on linux/amd64')
+          version = json.loads(docker('run', '--rm', requested, 'version', '--json'))
+          names = dict(gitVersion='git_version', gitCommit='git_commit', gitTreeState='git_tree_state',
+                       buildDate='build_date', goVersion='go_version', compiler='compiler', platform='platform')
+          require(isinstance(version, dict) and set(version) == set(names)
+                  and all(isinstance(value, str) for value in version.values()), 'unexpected Melange version document')
+          require(re.fullmatch(r'v\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?', version['gitVersion'])
+                  and re.fullmatch(r'[0-9a-f]{40}', version['gitCommit']), 'Melange did not report one release version')
+          require(version['platform'] == host, 'the Melange binary platform differs from the host platform')
+          source = Path('melange')
+          require(not (source / 'packages').exists() and not (source / 'melange-environment-evidence.json').exists(),
+                  'Melange outputs already exist before the build')
+          files, generated = snapshot(source)
+          configuration = 'melange/' + os.environ['MELANGE_CONFIG']
+          require(configuration in files, 'the Melange configuration is missing')
+          require({'melange.rsa', 'melange.rsa.pub'} <= set(generated), 'the ephemeral Melange signing key is missing')
+          tool = dict(requested_ref=requested, requested_digest=pin['digest'], resolved_digest=pin['digest'],
+                      version={names[key]: value for key, value in version.items()})
+          capture = dict(tool=tool, host_platform=host, configuration=configuration, source_files=files,
+                         generated=generated)
+          Path(os.environ['RUNNER_TEMP'], 'melange-environment-inputs.json').write_text(json.dumps(capture))
+          PY
+
       - name: Build CA package (amd64 + arm64)
         env:
           MELANGE_CONFIG: ${{ inputs.melange-config }}
@@ -159,6 +237,215 @@ jobs:
               build "$MELANGE_CONFIG" --arch "$ARCH" --signing-key melange.rsa --build-date "$BUILD_DATE"
           done
 
+      # HGC-02: the environment is Melange's own lock (.melange.yaml in every
+      # APK), read through the pinned tool; outputs are checked against
+      # .PKGINFO, datahash and APKINDEX before the receipt is written.
+      - name: Record structured Melange environment evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B - <<'PY'
+          import base64
+          import gzip
+          import hashlib
+          import io
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import tarfile
+          import tempfile
+          import zlib
+
+          GENERATED = {'binfmt-evidence.json', 'melange-version.txt', 'melange.rsa', 'melange.rsa.pub'}
+          TARGETS = {'aarch64': 'arm64', 'x86_64': 'amd64'}
+          SIGNATURE = '.SIGN.RSA256.melange.rsa.pub'
+          QUERY = ('{{range .Environment.Contents.Packages}}package\t{{.}}\n{{end}}'
+                   '{{range .Environment.Contents.Repositories}}repository\t{{.}}\n{{end}}'
+                   '{{range .Environment.Contents.Keyring}}keyring\t{{.}}\n{{end}}'
+                   '{{range .Environment.Archs}}arch\t{{.}}\n{{end}}'
+                   'name\t{{.Package.Name}}\nversion\t{{.Package.Version}}\nepoch\t{{.Package.Epoch}}\n')
+
+          def require(condition, message):
+              if not condition:
+                  raise ValueError(message)
+
+          def docker(*arguments):
+              return subprocess.run(['docker', *arguments], check=True, text=True, capture_output=True).stdout
+
+          def snapshot(root):
+              files, generated = {}, []
+              for path in sorted(root.rglob('*')):
+                  relative = path.relative_to(root).as_posix()
+                  if relative.split('/')[0] == 'packages':
+                      continue
+                  require(not path.is_symlink(), 'symbolic links are not accepted in the Melange source directory')
+                  if path.is_dir():
+                      continue
+                  require(path.is_file(), 'only regular files are accepted in the Melange source directory')
+                  if relative in GENERATED:
+                      generated.append(relative)
+                  else:
+                      files['melange/' + relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+              return files, generated
+
+          def query(path):
+              output = docker('run', '--rm', '-v', f'{path.parent.resolve()}:/query:ro', '-w', '/query',
+                              tool['requested_ref'], 'query', path.name, QUERY)
+              result = dict(package=[], repository=[], keyring=[], arch=[], name=[], version=[], epoch=[])
+              for line in output.splitlines():
+                  key, separator, value = line.partition('\t')
+                  require(separator and key in result and value and value == value.strip(),
+                          'unexpected Melange query output')
+                  result[key].append(value)
+              require(all(len(result[key]) == 1 for key in ('name', 'version', 'epoch'))
+                      and re.fullmatch(r'[0-9]+', result['epoch'][0]), 'Melange query did not report one package identity')
+              return result
+
+          def streams(raw):
+              parts, offset = [], 0
+              while offset < len(raw):
+                  stream = zlib.decompressobj(31)
+                  stream.decompress(raw[offset:])
+                  require(stream.eof, 'truncated APK stream')
+                  used = len(raw) - offset - len(stream.unused_data)
+                  parts.append(raw[offset:offset + used])
+                  offset += used
+              return parts
+
+          def members(stream):
+              with tarfile.open(fileobj=io.BytesIO(gzip.decompress(stream))) as archive:
+                  return {entry.name: archive.extractfile(entry).read() for entry in archive.getmembers() if entry.isfile()}
+
+          def one(values, key):
+              require(len(values.get(key, [])) == 1, f'package metadata must contain exactly one {key}')
+              return values[key][0]
+
+          inputs = json.loads(Path(os.environ['RUNNER_TEMP'], 'melange-environment-inputs.json').read_text())
+          tool = inputs['tool']
+          require(tool['requested_ref'] == os.environ['MELANGE_IMAGE'], 'the Melange image changed after the input capture')
+          files, generated = snapshot(Path('melange'))
+          require(files == inputs['source_files'] and generated == inputs['generated'],
+                  'the Melange source directory changed during the build')
+          configuration = inputs['configuration']
+          declared = query(Path(configuration))
+          identity = (declared['name'][0], declared['version'][0], declared['epoch'][0])
+          require(declared['repository'] and all(re.fullmatch(r'https://\S+', item) for item in declared['repository']),
+                  'Melange repositories must be explicit HTTPS locators')
+          keyring = []
+          for item in declared['keyring']:
+              require(re.fullmatch(r'[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*', item) and '..' not in item.split('/')
+                      and 'melange/' + item in files, 'Melange keyring must be a local file of the source directory')
+              keyring.append(dict(path='melange/' + item, sha256=files['melange/' + item]))
+          require(keyring, 'the Melange keyring is missing')
+          require(sorted(path.name for path in Path('melange/packages').iterdir()) == sorted(TARGETS),
+                  'Melange did not build exactly the expected target architectures')
+          targets, outputs = {}, {}
+          with tempfile.TemporaryDirectory() as temporary:
+              for arch, environment_arch in sorted(TARGETS.items()):
+                  directory = Path('melange/packages') / arch
+                  names = sorted(path.name for path in directory.iterdir())
+                  apks = [name for name in names if name.endswith('.apk')]
+                  require(apks and names == sorted(apks + ['APKINDEX.tar.gz']), f'unexpected Melange outputs for {arch}')
+                  with tarfile.open(directory / 'APKINDEX.tar.gz', 'r:gz') as archive:
+                      require(sorted(archive.getnames()) == sorted([SIGNATURE, 'APKINDEX', 'DESCRIPTION']),
+                              'APKINDEX is not signed by the ephemeral Melange key')
+                      blocks = archive.extractfile('APKINDEX').read().decode().strip().split('\n\n')
+                  index = {}
+                  for block in blocks:
+                      entry = {}
+                      for line in block.splitlines():
+                          key, separator, value = line.partition(':')
+                          require(separator and len(key) == 1 and key not in entry, 'malformed APKINDEX entry')
+                          entry[key] = value
+                      require((entry.get('P'), entry.get('V'), entry.get('A')) not in index, 'duplicate APKINDEX entry')
+                      index[(entry.get('P'), entry.get('V'), entry.get('A'))] = entry
+                  locks, records = set(), []
+                  for position, name in enumerate(apks):
+                      raw = (directory / name).read_bytes()
+                      parts = streams(raw)
+                      require(len(parts) == 3, 'APK must contain signature, control and data streams')
+                      require(sorted(members(parts[0])) == [SIGNATURE], 'APK is not signed by the ephemeral Melange key')
+                      control = members(parts[1])
+                      require('.PKGINFO' in control and '.melange.yaml' in control, 'APK lacks Melange package metadata')
+                      info = {}
+                      for line in control['.PKGINFO'].decode().splitlines():
+                          if line and not line.startswith('#'):
+                              key, separator, value = line.partition(' = ')
+                              require(separator, 'malformed .PKGINFO')
+                              info.setdefault(key, []).append(value)
+                      package = dict(name=one(info, 'pkgname'), version=one(info, 'pkgver'), arch=one(info, 'arch'),
+                                     origin=one(info, 'origin'), datahash=one(info, 'datahash'))
+                      require(package['arch'] == arch and name == f"{package['name']}-{package['version']}.apk",
+                              'APK metadata differs from its output location')
+                      require(hashlib.sha256(parts[2]).hexdigest() == package['datahash'],
+                              'APK data differs from its declared datahash')
+                      checksum = 'Q1' + base64.b64encode(hashlib.sha1(parts[1]).digest()).decode()
+                      entry = index.pop((package['name'], package['version'], arch), None)
+                      require(entry is not None and entry.get('C') == checksum and entry.get('S') == str(len(raw)),
+                              'APKINDEX does not describe the produced APK')
+                      data = members(parts[2])
+                      sbom = f"var/lib/db/sbom/{package['name']}-{package['version']}.spdx.json"
+                      require(sbom in data, 'APK lacks its Melange SBOM')
+                      creators = (json.loads(data[sbom]).get('creationInfo') or {}).get('creators') or []
+                      require(f"Tool: melange ({tool['version']['git_version']})" in creators,
+                              'APK was not produced by the inspected Melange version')
+                      lock = Path(temporary, f'{arch}-{position}', '.melange.yaml')
+                      lock.parent.mkdir()
+                      lock.write_bytes(control['.melange.yaml'])
+                      locks.add(json.dumps(query(lock), sort_keys=True))
+                      records.append(dict(path=f'melange/packages/{arch}/{name}', sha256=hashlib.sha256(raw).hexdigest(),
+                                          size=len(raw), control_checksum=checksum, **package))
+                  require(not index, 'APKINDEX lists packages that were not produced')
+                  require(len(locks) == 1, f'packages built for {arch} disagree on the build environment')
+                  lock = json.loads(locks.pop())
+                  require((lock['name'][0], lock['version'][0], lock['epoch'][0]) == identity
+                          and lock['arch'] == [environment_arch], 'embedded Melange configuration differs from the request')
+                  require(lock['repository'] == declared['repository'] and lock['keyring'] == declared['keyring'],
+                          'locked repositories or keyring differ from the Melange configuration')
+                  require((identity[0], f'{identity[1]}-r{identity[2]}') in {(r['name'], r['version']) for r in records},
+                          'the configured package was not produced')
+                  packages = []
+                  for item in lock['package']:
+                      match = re.fullmatch(r'([A-Za-z0-9][A-Za-z0-9+._-]*)=([0-9A-Za-z][0-9A-Za-z+._~-]*-r[0-9]+)', item)
+                      require(match, 'build environment package is not locked to an exact version')
+                      packages.append(dict(name=match[1], version=match[2]))
+                  require(packages and len({p['name'] for p in packages}) == len(packages),
+                          'incomplete or ambiguous build environment inventory')
+                  targets[arch] = dict(environment_arch=environment_arch,
+                                       packages=sorted(packages, key=lambda p: p['name']))
+                  outputs[arch] = sorted(records, key=lambda record: record['path'])
+          caller_repository = os.environ['GITHUB_REPOSITORY']
+          repository = caller_repository.lower()
+          require(re.fullmatch(r'[a-z0-9][a-z0-9_.-]*/[a-z0-9][a-z0-9_.-]*', repository), 'invalid producer repository')
+          workflow_ref = os.environ['GITHUB_WORKFLOW_REF']
+          require(workflow_ref.startswith(caller_repository + '/.github/workflows/'), 'unexpected workflow repository')
+          workflow, separator, workflow_revision = workflow_ref[len(caller_repository) + 1:].partition('@')
+          require(separator and workflow_revision and re.fullmatch(r'\.github/workflows/[A-Za-z0-9_.-]+\.ya?ml', workflow),
+                  'unexpected workflow identity')
+          run, attempt = int(os.environ['GITHUB_RUN_ID']), int(os.environ['GITHUB_RUN_ATTEMPT'])
+          require(run > 0 and attempt > 0, 'invalid producer run or attempt')
+          require(re.fullmatch(r'[0-9a-f]{40}', os.environ['GITHUB_SHA']), 'invalid producer source SHA')
+          require(re.fullmatch(r'refs/(?:heads|tags)/[^\s]+|refs/pull/[0-9]+/(?:head|merge)', os.environ['GITHUB_REF'])
+                  and '..' not in os.environ['GITHUB_REF'], 'invalid producer ref')
+          producer = dict(repository=repository, ref=os.environ['GITHUB_REF'], source_sha=os.environ['GITHUB_SHA'],
+                          run_id=run, run_attempt=attempt, release_id=f'r{run}-a{attempt}', workflow=workflow)
+          environment = dict(tool=tool, host_platform=inputs['host_platform'],
+                             configuration=dict(path=configuration, sha256=files[configuration],
+                                                package=dict(name=identity[0], version=identity[1], epoch=int(identity[2]))),
+                             source_files=[dict(path=path, sha256=digest) for path, digest in sorted(files.items())],
+                             repositories=declared['repository'], keyring=keyring, targets=targets)
+          canonical = lambda value: json.dumps(value, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()
+          signing_key = Path('melange/melange.rsa.pub').read_bytes()
+          document = dict(schema_version=1, kind='melange-environment-evidence', producer=producer,
+                          environment=environment, environment_digest='sha256:' + hashlib.sha256(canonical(environment)).hexdigest(),
+                          outputs=outputs, signing_key=dict(path='melange/melange.rsa.pub',
+                                                            sha256=hashlib.sha256(signing_key).hexdigest()),
+                          generated_workspace_files=sorted('melange/' + name for name in generated))
+          Path('melange/melange-environment-evidence.json').write_bytes(canonical(document))
+          PY
+
       - name: Upload melange repository
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -169,6 +456,7 @@ jobs:
             melange/melange.rsa.pub
             melange/melange-version.txt
             melange/binfmt-evidence.json
+            melange/melange-environment-evidence.json
           retention-days: 30
 
   validate:
@@ -232,6 +520,7 @@ jobs:
           python3 -B .github/scripts/oci_artifact.py prepare "${FRAMEWORK}.oci"
           # Keep the original receipt with each candidate; HGC-04 will persist it durably.
           cp melange-repo/binfmt-evidence.json "${FRAMEWORK}.oci/binfmt-evidence.json"
+          cp melange-repo/melange-environment-evidence.json "${FRAMEWORK}.oci/melange-environment-evidence.json"
 
       - name: Preserve SBOMs and replay inputs
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -243,6 +532,7 @@ jobs:
             ${{ matrix.framework }}.oci/build-inputs.json
             ${{ matrix.framework }}.oci/validated-index.json
             ${{ matrix.framework }}.oci/binfmt-evidence.json
+            ${{ matrix.framework }}.oci/melange-environment-evidence.json
           retention-days: 30
           if-no-files-found: error
 

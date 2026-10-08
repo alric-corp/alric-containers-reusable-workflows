@@ -30,7 +30,7 @@ correção é informativo; ele não substitui nem neutraliza o gate.
 
 | Artifact | Conteúdo/consumo | Retenção |
 | --- | --- | --- |
-| `melange-repo` | Pacotes, chave pública efêmera, versão Melange e receipt binfmt | 30 dias |
+| `melange-repo` | Pacotes, chave pública efêmera, versão Melange, receipt binfmt e evidência do ambiente Melange | 30 dias |
 | `build-scans-<framework>-<attempt>` | Relatórios em `reports/` | 30 dias |
 | `sbom-<framework>-<attempt>` | SPDX original, lock, data/revisão e índice validado | 30 dias |
 | `validated-oci-<framework>` | Layout OCI + índice validado; só existe após sucesso | 3 dias |
@@ -68,6 +68,48 @@ seus bytes originais em authority durável create-once. O receipt não se
 autoautentica, não autoriza publication, não habilita proving e não fecha o
 gap hospedado sem execução, read-back e revisão. O consumidor só deve
 adotar esta alteração após merge revisado e repin em SHA literal.
+
+### HGC-02 — ambiente Melange
+
+Antes do build, `Capture Melange environment inputs` verifica `MELANGE_IMAGE`
+(`cgr.dev/chainguard/melange@sha256:…`, sem `latest`): `RepoDigests` do
+repositório `cgr.dev/chainguard/melange` deve ser exatamente o digest pedido;
+`melange version --json` precisa trazer uma versão de release, commit e
+plataforma `linux/amd64`, igual à da imagem. Também registra SHA-256 de cada
+arquivo regular de `melange/` (o diretório que o Melange copia para o
+workspace), separando os arquivos gerados pelo run (`melange.rsa*`,
+`melange-version.txt`, `binfmt-evidence.json`). A captura fica em
+`RUNNER_TEMP` e nunca é publicada.
+
+Depois do build, `Record structured Melange environment evidence` exige o
+mesmo diretório de origem e lê o ambiente do lock que o próprio Melange grava
+em cada APK (`.melange.yaml`, `environment.contents` travado pelo apko),
+usando `melange query` da imagem pinada. Esse lock é o inventário completo
+`nome=versão` do ambiente de cada arquitetura; o Melange v0.61.2 não expõe
+checksums desses pacotes (o SLSA de `--generate-provenance` traz
+`resolvedDependencies` vazio), então a identidade material dos pacotes do
+ambiente não é declarada. Repositórios e keyring do lock precisam igualar a
+configuração; o keyring precisa ser arquivo local com SHA-256. Chaves que o
+apko descubra no repositório (`apk-configuration`) não aparecem no lock e
+continuam sendo o risco residual do P1-03.
+
+Cada APK de `x86_64` e `aarch64` é conferido pelo `.PKGINFO` (nome, versão,
+arch, origin), pelo `datahash` (SHA-256 do stream de dados), pelo `APKINDEX`
+assinado pela chave efêmera (`C:` e `S:`) e pelo SBOM gerado pela mesma versão
+do Melange. `melange/melange-environment-evidence.json` (schema fechado v1,
+kind `melange-environment-evidence`, JSON canônico) separa `environment`
+(ferramenta, host, configuração, arquivos de origem, repositórios, keyring e
+lock por arquitetura) dos dados da execução (producer, outputs, chave
+efêmera e arquivos gerados). `environment_digest` é o SHA-256 da forma
+canônica de `environment`: dois builds com o mesmo valor usaram o mesmo
+ambiente Melange, sem afirmar que aconteceram no mesmo run nem que produzem
+os mesmos bytes (HGC-03).
+
+O arquivo original viaja em `melange-repo` e é copiado sem reserialização
+para cada layout e artifact de replay como `melange-environment-evidence.json`.
+Status: `HGC02_STATUS = IMPLEMENTED`, `PROVING_STATUS = NONE`; a prova
+hospedada depende de merge revisado e repin do consumidor, e a persistência
+durável continua com o HGC-04.
 
 ## Composição v2 (opt-in)
 

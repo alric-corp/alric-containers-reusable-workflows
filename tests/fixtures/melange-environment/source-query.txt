@@ -1,0 +1,6 @@
+package	busybox
+repository	https://packages.wolfi.dev/os
+keyring	keys/wolfi-signing.rsa.pub
+name	image-base-ca-certificates
+version	1.0.0
+epoch	0
