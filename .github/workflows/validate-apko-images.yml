@@ -731,7 +731,7 @@ jobs:
           PY
 
       - name: Upload melange repository
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: melange-repo
           overwrite: true
@@ -744,7 +744,7 @@ jobs:
           retention-days: 30
 
       - name: Upload Melange reproduction reference
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: melange-reproduction-reference
           overwrite: true
@@ -1388,7 +1388,7 @@ jobs:
 
       # The receipt keeps its artifact path; rebuild/ adds the public outputs.
       - name: Upload Melange reproducibility evidence
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: melange-reproducibility
           overwrite: true
@@ -1399,7 +1399,7 @@ jobs:
       # Diagnostics never carry the validated status and never feed validate.
       - name: Preserve reproducibility diagnostics
         if: ${{ failure() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: melange-reproducibility-diagnostics-${{ github.run_attempt }}
           path: ${{ runner.temp }}/melange-reproducibility-diagnostics/
@@ -1554,7 +1554,7 @@ jobs:
             "${FRAMEWORK}.oci/melange-reproducibility-evidence.json"
 
       - name: Preserve SBOMs and replay inputs
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: sbom-${{ matrix.framework }}-${{ github.run_attempt }}
           path: |
@@ -1592,7 +1592,7 @@ jobs:
 
       - name: Preserve scan evidence
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: build-scans-${{ matrix.framework }}-${{ github.run_attempt }}
           path: reports/
@@ -1600,7 +1600,7 @@ jobs:
           if-no-files-found: warn
 
       - name: Preserve validated OCI artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           # Mesmo nome no run: retries do publicador reutilizam a validação
           # aprovada. Novo conteúdo só substitui o anterior depois do scan.
