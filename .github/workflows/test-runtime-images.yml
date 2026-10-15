@@ -66,7 +66,7 @@ jobs:
         with:
           platforms: arm64
       - name: Download existing candidate OCI
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: validated-oci-${{ inputs.framework }}
           path: candidate.oci
@@ -77,7 +77,7 @@ jobs:
       # não uma imagem de registry — o par testado é o par candidato.
       - name: Download candidate build variant
         if: steps.contract.outputs.dev != ''
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: validated-oci-${{ steps.contract.outputs.dev }}
           path: candidate-dev.oci
